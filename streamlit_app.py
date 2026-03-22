@@ -1,58 +1,83 @@
-def debug_bkng_values():
-    df = yf.download("BKNG", period="1y", interval="1d", auto_adjust=True, progress=False)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-    
-    # Standard calculations from your script
-    df["ma_fast"] = df["Close"].rolling(10).mean()
-    df["ma_slow"] = df["Close"].rolling(20).mean()
-    df["direction"] = calc_supertrend(df).values
-    bull_x, _ = ma_cross_within(df)
-    
-    row = df.iloc[-1]
-    
-    # Data for the 5 items
-    items = {
-        "1. Supertrend Direction": {
-            "Value": "Uptrend (-1)" if row["direction"] == -1 else "Downtrend (+1)",
-            "Requirement": "Must be -1",
-            "Result": row["direction"] == -1,
-            "Explanation": "Determines the overall trend bias using ATR and price volatility."
-        },
-        "2. MA Alignment": {
-            "Value": f"10MA: {row['ma_fast']:.2f} | 20MA: {row['ma_slow']:.2f}",
-            "Requirement": "10MA > 20MA",
-            "Result": row["ma_fast"] > row["ma_slow"],
-            "Explanation": "Ensures short-term momentum is stronger than long-term momentum."
-        },
-        "3. Recent Crossover": {
-            "Value": "Yes" if bull_x else "No",
-            "Requirement": "True (within last 10 days)",
-            "Result": bull_x,
-            "Explanation": "Ensures the 10MA recently crossed above the 20MA to catch the start of a move."
-        },
-        "4. The MA20 Touch": {
-            "Value": f"Low: {row['Low']:.2f} | 20MA: {row['ma_slow']:.2f}",
-            "Requirement": "Low <= 20MA AND Close > 20MA",
-            "Result": (row["Low"] <= row["ma_slow"]) and (row["Close"] > row["ma_slow"]),
-            "Explanation": "This is a 'mean reversion' check; the price must dip to the average and bounce."
-        },
-        "5. Candle Color": {
-            "Value": f"Open: {row['Open']:.2f} | Close: {row['Close']:.2f}",
-            "Requirement": "Close > Open",
-            "Result": row["Close"] > row["Open"],
-            "Explanation": "Ensures buying pressure is present on the final day (Green candle)."
-        }
-    }
-    return items
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import numpy as np
 
-# --- STREAMLIT UI DISPLAY ---
+# --- 1. CORE LOGIC ---
+def get_debug_data(symbol):
+    try:
+        df = yf.download(symbol, period="1y", interval="1d", auto_adjust=True, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(-1)
+        
+        # Calculations
+        df["ma_fast"] = df["Close"].rolling(10).mean()
+        df["ma_slow"] = df["Close"].rolling(20).mean()
+        # Using the exact calc_supertrend function from earlier
+        df["direction"] = calc_supertrend(df).values 
+        bull_x, _ = ma_cross_within(df)
+        
+        curr = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        # Data for the 5 Items
+        debug_items = [
+            {
+                "item": "1. Supertrend Direction",
+                "value": f"{int(curr['direction'])}",
+                "req": "Must be -1 (Uptrend)",
+                "passed": curr["direction"] == -1,
+                "explanation": "This is the primary trend filter. If it's +1, the trend is bearish."
+            },
+            {
+                "item": "2. MA Alignment",
+                "value": f"10MA: {curr['ma_fast']:.2f} vs 20MA: {curr['ma_slow']:.2f}",
+                "req": "10MA > 20MA",
+                "passed": curr["ma_fast"] > curr["ma_slow"],
+                "explanation": "Confirms short-term momentum is higher than long-term momentum."
+            },
+            {
+                "item": "3. Recent Crossover",
+                "value": "Detected" if bull_x else "Not Detected",
+                "req": "Cross within last 10 days",
+                "passed": bull_x,
+                "explanation": "Ensures you aren't entering a trade that has already 'run' too far."
+            },
+            {
+                "item": "4. The 'Touch' Rule",
+                "value": f"Low: {curr['Low']:.2f} | 20MA: {curr['ma_slow']:.2f}",
+                "req": "Low <= 20MA and Close > 20MA",
+                "passed": (curr["Low"] <= curr["ma_slow"]) and (curr["Close"] > curr["ma_slow"]),
+                "explanation": "Price must dip to the 20MA (test support) and hold above it."
+            },
+            {
+                "item": "5. Candle Color",
+                "value": f"Open: {curr['Open']:.2f} | Close: {curr['Close']:.2f}",
+                "req": "Close > Open",
+                "passed": curr["Close"] > curr["Open"],
+                "explanation": "Ensures the day ended with buying pressure (Green Candle)."
+            }
+        ]
+        return debug_items
+    except Exception as e:
+        st.error(f"Error fetching BKNG: {e}")
+        return None
+
+# --- 2. THE UI SECTION ---
+st.header("🔍 BKNG Deep Dive Debugger")
+st.write("This tool checks why BKNG is or is not appearing in your results today.")
+
 if st.button("Deep Dive: BKNG Current Values"):
-    results = debug_bkng_values()
+    stats = get_debug_data("BKNG")
     
-    for label, data in results.items():
-        status = "✅ PASS" if data["Result"] else "❌ FAIL"
-        with st.expander(f"{status} - {label}"):
-            st.write(f"**Current Value:** {data['Value']}")
-            st.write(f"**Requirement:** {data['Requirement']}")
-            st.info(f"**Why this matters:** {data['Explanation']}")
+    if stats:
+        for s in stats:
+            icon = "✅" if s["passed"] else "❌"
+            color = "green" if s["passed"] else "red"
+            
+            with st.expander(f"{icon} {s['item']}"):
+                st.markdown(f"**Status:** :{color}[{'PASSED' if s['passed'] else 'FAILED'}]")
+                st.write(f"**Current Value:** {s['value']}")
+                st.write(f"**Requirement:** {s['req']}")
+                st.divider()
+                st.caption(f"**Why this item exists:** {s['explanation']}")
