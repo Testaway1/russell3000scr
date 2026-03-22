@@ -8,10 +8,10 @@ ATR_PERIOD        = 10
 FACTOR            = 3.0
 MA_FAST           = 10
 MA_SLOW           = 20
-MA_CROSS_LOOKBACK = 11  # Updated to 11 days as requested
+MA_CROSS_LOOKBACK = 11  # Updated to 11 days
 
 def calc_supertrend(df):
-    """Exact logic from your original script."""
+    """Exact logic from the original python file."""
     high, low, close = df["High"], df["Low"], df["Close"]
     tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
     atr = tr.ewm(alpha=1.0/ATR_PERIOD, adjust=False).mean()
@@ -33,9 +33,16 @@ def get_bkng_analysis():
     # 1. Download Data
     df = yf.download("BKNG", period="1y", interval="1d", auto_adjust=True, progress=False)
     
-    # 2. FIX KEYERROR: Force flatten the headers
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
+    # 2. THE FIX: Forcefully flatten headers to single strings
+    # This removes the ('BKNG', 'Close') structure and makes it just 'Close'
+    if not df.empty:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(-1)
+        # Ensure column names are standard strings
+        df.columns = [str(c) for c in df.columns]
+    
+    if df.empty or "Close" not in df.columns:
+        return None
     
     # 3. Indicators
     df["ma_fast"] = df["Close"].rolling(MA_FAST).mean()
@@ -56,60 +63,58 @@ def get_bkng_analysis():
 
     curr = df.iloc[-1]
     
-    # 5. Build Result Table
+    # 5. The 5 Data Items Breakdown
     checks = [
         {
             "Item": "1. Supertrend Direction",
             "Value": f"{int(curr['direction'])}",
             "Req": "-1 (Uptrend)",
             "Status": curr["direction"] == -1,
-            "Explanation": "Determines if the volatility-based trend is bullish. -1 means the price is above the 'stop' line."
+            "Explanation": "Determines if the volatility trend is bullish. -1 is required for Longs."
         },
         {
             "Item": "2. MA Alignment",
             "Value": f"10MA: ${curr['ma_fast']:,.2f} > 20MA: ${curr['ma_slow']:,.2f}",
             "Req": "True",
             "Status": curr["ma_fast"] > curr["ma_slow"],
-            "Explanation": "Confirms that short-term price strength is higher than the medium-term average."
+            "Explanation": "Confirms short-term momentum is currently above the 20-day average."
         },
         {
             "Item": "3. Recent Crossover",
             "Value": f"Crossed on {cross_day}",
             "Req": "Within 11 Days",
             "Status": bull_cross,
-            "Explanation": "The 'Golden Cross' must be fresh. This ensures we aren't buying after the move is exhausted."
+            "Explanation": "The 10MA must have crossed the 20MA recently (within 11 trading bars)."
         },
         {
             "Item": "4. The 'Touch' Rule",
             "Value": f"Low: ${curr['Low']:,.2f} vs 20MA: ${curr['ma_slow']:,.2f}",
             "Req": "Low <= 20MA",
-            "Status": curr["Low"] <= curr["ma_slow"],
-            "Explanation": "The price must pull back to test the 20-day MA (support) before the entry triggers."
+            "Status": (curr["Low"] <= curr["ma_slow"]) and (curr["Close"] > curr["ma_slow"]),
+            "Explanation": "Price must dip to touch the 20-day MA (acting as support) and close above it."
         },
         {
             "Item": "5. Bullish Candle",
             "Value": f"Open: ${curr['Open']:,.2f} / Close: ${curr['Close']:,.2f}",
             "Req": "Close > Open",
             "Status": curr["Close"] > curr["Open"],
-            "Explanation": "Ensures the final day was a 'Green Day', showing buyers are active at support."
+            "Explanation": "The current day must be a 'Green' candle to show buyers are stepping in."
         }
     ]
     return checks
 
 # --- UI ---
-st.title("BKNG Logic Inspector (11-Day Test)")
+st.title("BKNG 11-Day Logic Inspector")
 
-if st.button("Analyze BKNG Now"):
+if st.button("Deep Dive: BKNG Analysis"):
     results = get_bkng_analysis()
     
-    for r in results:
-        icon = "✅" if r["Status"] else "❌"
-        with st.expander(f"{icon} {r['Item']}"):
-            st.write(f"**Current Value:** {r['Value']}")
-            st.write(f"**Requirement:** {r['Req']}")
-            st.info(f"**Why this matters:** {r['Explanation']}")
-
-    if all(r["Status"] for r in results):
-        st.success("BKNG IS A MATCH!")
+    if results:
+        for r in results:
+            icon = "✅" if r["Status"] else "❌"
+            with st.expander(f"{icon} {r['Item']}"):
+                st.write(f"**Current Value:** {r['Value']}")
+                st.write(f"**Requirement:** {r['Req']}")
+                st.info(f"**Logic:** {r['Explanation']}")
     else:
-        st.error("BKNG still does not match all criteria.")
+        st.error("Data error: Still unable to find 'Close' column. Please check yfinance version.")
