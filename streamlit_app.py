@@ -333,6 +333,29 @@ if as_of_date.weekday() >= 5:
         "yfinance will use the last available trading day on or before this date."
     )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("💰 Capital Allocation")
+capital = st.sidebar.number_input(
+    "Total capital ($)",
+    min_value=1_000,
+    max_value=100_000_000,
+    value=100_000,
+    step=1_000,
+    help="Total portfolio capital used to size positions."
+)
+max_risk_pct = st.sidebar.number_input(
+    "Max risk per trade (% of capital)",
+    min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+    help="Maximum $ loss if stop is hit, as a % of capital. Default 1%."
+)
+max_position_pct = st.sidebar.number_input(
+    "Max position size (% of capital)",
+    min_value=1.0, max_value=100.0, value=20.0, step=1.0,
+    help="Maximum $ allocated to a single position, as a % of capital. Default 20%."
+)
+max_risk_dollars     = capital * (max_risk_pct     / 100)
+max_position_dollars = capital * (max_position_pct / 100)
+
 run_button = st.sidebar.button("🚀 Run Screener")
 
 # --- Main scan loop ---
@@ -390,19 +413,38 @@ if run_button:
             if sig is None:
                 continue
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-            chg  = (last["Close"] - prev["Close"]) / prev["Close"] * 100
+            last  = df.iloc[-1]
+            prev  = df.iloc[-2]
+            chg   = (last["Close"] - prev["Close"]) / prev["Close"] * 100
+            price = float(last["Close"])
+            sl    = float(last["Low"])    # stop loss = low of signal bar
+
+            # ── Position sizing ──────────────────────────────────────────────
+            # Risk-based shares: risk $max_risk_dollars, stop = price - sl
+            risk_per_share = price - sl
+            if risk_per_share > 0:
+                shares_by_risk     = max_risk_dollars / risk_per_share
+                shares_by_position = max_position_dollars / price
+                shares             = int(min(shares_by_risk, shares_by_position))
+            else:
+                shares = 0
+
+            position_value = shares * price
+            dollar_risk    = shares * risk_per_share if shares > 0 else 0.0
 
             row = {
                 "Ticker":           ticker,
                 "Signal":           sig,
-                "Price":            f"${float(last['Close']):.2f}",
-                "MA10":             f"${float(last['ma_fast']):.2f}",
-                "MA20":             f"${float(last['ma_slow']):.2f}",
-                "Change %":         f"{chg:.2f}%",
-                "Cross (days ago)": days_ago,
                 "Date":             df.index[-1].strftime("%Y-%m-%d"),
+                "Price ($)":        round(price, 2),
+                "Stop Loss ($)":    round(sl, 2),
+                "Shares":           shares,
+                "Position ($)":     round(position_value, 2),
+                "Risk ($)":         round(dollar_risk, 2),
+                "MA10 ($)":         round(float(last["ma_fast"]), 2),
+                "MA20 ($)":         round(float(last["ma_slow"]), 2),
+                "Change %":         round(chg, 2),
+                "Cross (days ago)": days_ago,
             }
 
             if sig == "LONG":
@@ -419,39 +461,70 @@ if run_button:
             st.write("\n".join(errors[:30]))
 
     st.header(f"📊 Results — as of {as_of_date.strftime('%d %b %Y')}")
-    col1, col2 = st.columns(2)
 
-    with col1:
-        st.subheader("🟢 Long Signals")
-        if long_hits:
-            df_long = pd.DataFrame(long_hits)
-            st.dataframe(df_long, use_container_width=True)
-            st.download_button(
-                "📥 Download CSV", df_long.to_csv(index=False),
-                f"long_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv"
-            )
-        else:
-            st.info("No long signals found.")
-
-    with col2:
-        st.subheader("🔴 Short Signals")
-        if short_hits:
-            df_short = pd.DataFrame(short_hits)
-            st.dataframe(df_short, use_container_width=True)
-            st.download_button(
-                "📥 Download CSV", df_short.to_csv(index=False),
-                f"short_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv"
-            )
-        else:
-            st.info("No short signals found.")
-
-    st.subheader("📈 Summary")
+    # ── Summary metrics ───────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Tickers Scanned", total)
     c2.metric("Long Signals",    len(long_hits))
     c3.metric("Short Signals",   len(short_hits))
     success_rate = (total - len(errors)) / total * 100 if total else 0
     c4.metric("Success Rate",    f"{success_rate:.1f}%")
+
+    st.markdown("---")
+
+    # ── Capital allocation summary ────────────────────────────────────────────
+    st.caption(
+        f"Capital: **${capital:,.0f}**  |  "
+        f"Max risk/trade: **${max_risk_dollars:,.0f}** ({max_risk_pct}%)  |  "
+        f"Max position: **${max_position_dollars:,.0f}** ({max_position_pct}%)"
+    )
+
+    # ── Long signals table ────────────────────────────────────────────────────
+    st.subheader("🟢 Long Signals")
+    if long_hits:
+        df_long = pd.DataFrame(long_hits)
+
+        # Display column order
+        display_cols = [
+            "Ticker", "Date", "Price ($)", "Stop Loss ($)",
+            "Shares", "Position ($)", "Risk ($)",
+            "MA10 ($)", "MA20 ($)", "Change %", "Cross (days ago)",
+        ]
+        df_display = df_long[display_cols].copy()
+
+        # Format for display
+        fmt_dollar = ["Price ($)", "Stop Loss ($)", "MA10 ($)", "MA20 ($)"]
+        fmt_money  = ["Position ($)", "Risk ($)"]
+
+        st.dataframe(
+            df_display.style
+                .format({c: "${:,.2f}" for c in fmt_dollar})
+                .format({c: "${:,.0f}" for c in fmt_money})
+                .format({"Change %": "{:+.2f}%", "Shares": "{:,}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # Aggregate risk exposure
+        total_position = df_long["Position ($)"].sum()
+        total_risk     = df_long["Risk ($)"].sum()
+        pct_deployed   = total_position / capital * 100 if capital else 0
+        pct_at_risk    = total_risk     / capital * 100 if capital else 0
+
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.metric("Signals found",    len(long_hits))
+        ec2.metric("Total deployed",   f"${total_position:,.0f}  ({pct_deployed:.1f}%)")
+        ec3.metric("Total $ at risk",  f"${total_risk:,.0f}  ({pct_at_risk:.1f}%)")
+        ec4.metric("Avg risk/trade",   f"${total_risk / len(long_hits):,.0f}" if long_hits else "—")
+
+        st.download_button(
+            "📥 Download Long Signals CSV",
+            df_long.to_csv(index=False),
+            f"long_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            "text/csv",
+        )
+    else:
+        st.info("No long signals found.")
 
 else:
     st.info("👈 Click 'Run Screener' in the sidebar to start.")
