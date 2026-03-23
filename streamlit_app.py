@@ -2,140 +2,109 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import numpy as np
+from streamlit_gsheets import GSheetsConnection
+from datetime import datetime
+import time
 
-# --- 1. CONFIGURATION ---
-MA_CROSS_LOOKBACK = 11  # Set to 11 days for this exercise
+# --- CONFIG & INDICATOR LOGIC ---
+ATR_PERIOD = 10
+FACTOR = 3.0
+MA_FAST = 10
+MA_SLOW = 20
 
-# --- 2. THE LOGIC (FIXED FOR MULTI-INDEX) ---
 def calc_supertrend(df):
-    """Fixed to handle scalar comparisons correctly."""
-    high = df['High']
-    low = df['Low']
-    close = df['Close']
-    
-    # 10-period ATR
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0/10, adjust=False).mean()
-    hl2 = (high + low) / 2.0
-    
-    # Basic Bands
-    upper = hl2 + 3.0 * atr
-    lower = hl2 - 3.0 * atr
-    
-    n = len(df)
-    f_u, f_l = np.zeros(n), np.zeros(n)
-    direction = np.ones(n)
-    st_line = np.zeros(n)
-    
-    for i in range(1, n):
-        # We use .item() or float() to ensure we are comparing single numbers
-        curr_u, prev_f_u = float(upper.iloc[i]), float(f_u[i-1])
-        curr_l, prev_f_l = float(lower.iloc[i]), float(f_l[i-1])
-        prev_close = float(close.iloc[i-1])
+    """Calculate Supertrend indicator"""
+    try:
+        high, low, close = df["High"], df["Low"], df["Close"]
         
-        # Final Bands
-        f_u[i] = curr_u if curr_u < prev_f_u or prev_close > prev_f_u else prev_f_u
-        f_l[i] = curr_l if curr_l > prev_f_l or prev_close < prev_f_l else prev_f_l
+        # True Range
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         
-        # Direction
-        if st_line[i-1] == f_u[i-1]:
-            direction[i] = 1 if float(close.iloc[i]) <= f_u[i] else -1
-        else:
-            direction[i] = -1 if float(close.iloc[i]) >= f_l[i] else 1
-        st_line[i] = f_l[i] if direction[i] == -1 else f_u[i]
+        # Average True Range
+        atr = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False).mean()
         
-    return direction
-
-def get_bkng_analysis():
-    # A. Download with specific settings
-    df = yf.download("BKNG", period="1y", interval="1d", auto_adjust=True)
-    
-    if df.empty: return None
-
-    # B. THE "NUCLEAR" FIX FOR KEYERROR 'CLOSE'
-    # This strips away ticker names and keeps only 'Close', 'Open', etc.
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
-    
-    # Ensure columns are properly named
-    df.columns = [str(c).strip().capitalize() for c in df.columns]
-
-    # C. Indicators
-    df["ma_fast"] = df["Close"].rolling(10).mean()
-    df["ma_slow"] = df["Close"].rolling(20).mean()
-    df["direction"] = calc_supertrend(df)
-    
-    # D. Bullish Cross Check (last 11 days)
-    fast, slow = df["ma_fast"].values, df["ma_slow"].values
-    cross_found, days_ago = False, 0
-    for i in range(len(df)-1, len(df)-1-MA_CROSS_LOOKBACK, -1):
-        if i <= 0: break
-        if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:
-            cross_found = True
-            days_ago = len(df) - 1 - i
-            break
-
-    curr = df.iloc[-1]
-    
-    # E. Data for the 5 Criteria
-    results = [
-        {
-            "Item": "1. Supertrend Direction",
-            "Value": f"Direction: {int(curr['direction'])}",
-            "Req": "Must be -1 (Uptrend)",
-            "Status": curr["direction"] == -1,
-            "Explain": "Checks if the price is above the volatility support line. -1 is a 'Go' for Longs."
-        },
-        {
-            "Item": "2. MA Alignment",
-            "Value": f"10MA: ${curr['ma_fast']:,.2f} > 20MA: ${curr['ma_slow']:,.2f}",
-            "Req": "10MA > 20MA",
-            "Status": curr["ma_fast"] > curr["ma_slow"],
-            "Explain": "Confirms that the short-term trend is stronger than the long-term trend."
-        },
-        {
-            "Item": "3. Recent Crossover",
-            "Value": f"Crossed {days_ago} days ago" if cross_found else "No cross found",
-            "Req": f"Within last {MA_CROSS_LOOKBACK} days",
-            "Status": cross_found,
-            "Explain": "Ensures the 'Golden Cross' (10 over 20) is fresh so you aren't chasing a tired move."
-        },
-        {
-            "Item": "4. The 'Touch' Rule",
-            "Value": f"Low: ${curr['Low']:,.2f} / 20MA: ${curr['ma_slow']:,.2f}",
-            "Req": "Low <= 20MA AND Close > 20MA",
-            "Status": (curr["Low"] <= curr["ma_slow"]) and (curr["Close"] > curr["ma_slow"]),
-            "Explain": "A 'Buy the Dip' check. Price must have dipped to touch the 20-day average and held above it."
-        },
-        {
-            "Item": "5. Bullish Candle",
-            "Value": f"Open: ${curr['Open']:,.2f} | Close: ${curr['Close']:,.2f}",
-            "Req": "Close > Open",
-            "Status": curr["Close"] > curr["Open"],
-            "Explain": "Ensures the current day is a 'Green Day', confirming buying pressure exists right now."
-        }
-    ]
-    return results
-
-# --- 3. STREAMLIT UI ---
-st.title("BKNG Signal Deep-Dive (11-Day Test)")
-
-if st.button("Run BKNG Logic Check"):
-    data_items = get_bkng_analysis()
-    
-    if data_items:
-        for item in data_items:
-            icon = "✅" if item["Status"] else "❌"
-            color = "green" if item["Status"] else "red"
+        # Basic Upper and Lower bands
+        hl2 = (high + low) / 2.0
+        basic_upper = hl2 + FACTOR * atr
+        basic_lower = hl2 - FACTOR * atr
+        
+        # Calculate direction
+        n = len(df)
+        upper = np.zeros(n)
+        lower = np.zeros(n)
+        direction = np.ones(n)
+        
+        for i in range(1, n):
+            # Upper band logic
+            if basic_upper.iloc[i] < upper[i-1] or close.iloc[i-1] > upper[i-1]:
+                upper[i] = basic_upper.iloc[i]
+            else:
+                upper[i] = upper[i-1]
             
-            with st.expander(f"{icon} {item['Item']}"):
-                st.markdown(f"**Current Value:** :{color}[{item['Value']}]")
-                st.write(f"**Requirement:** {item['Req']}")
-                st.info(f"**Why this matters:** {item['Explain']}")
-                
-        if all(i["Status"] for i in data_items):
-            st.success("BKNG IS A VALID SIGNAL TODAY!")
+            # Lower band logic
+            if basic_lower.iloc[i] > lower[i-1] or close.iloc[i-1] < lower[i-1]:
+                lower[i] = basic_lower.iloc[i]
+            else:
+                lower[i] = lower[i-1]
+            
+            # Direction logic
+            if direction[i-1] == 1:
+                direction[i] = 1 if close.iloc[i] <= upper[i] else -1
+            else:
+                direction[i] = -1 if close.iloc[i] >= lower[i] else 1
+        
+        return direction
+    except Exception as e:
+        st.error(f"Error in supertrend calculation: {e}")
+        return None
+
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Russell 3000 Screener", layout="wide")
+st.title("📈 Russell 3000 Cloud Screener")
+st.subheader("Supertrend + MA Confluence (Daily)")
+
+# Debug section
+with st.expander("🔧 Connection Debug Info"):
+    st.write("Checking connection configuration...")
+    
+    # Show available secrets (without revealing actual values)
+    try:
+        st.write("Secrets available:", list(st.secrets.keys()) if hasattr(st, 'secrets') else "No secrets found")
+    except:
+        st.write("Unable to access secrets")
+
+# Initialize Google Sheets Connection with better error handling
+try:
+    st.write("Attempting to connect to Google Sheets...")
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    
+    # Test the connection with a simple read
+    df_tickers = conn.read(ttl="10m")
+    
+    if df_tickers is not None and not df_tickers.empty:
+        # Check if the dataframe has the expected column
+        if "Ticker" in df_tickers.columns:
+            tickers = df_tickers["Ticker"].dropna().unique().tolist()
+            st.sidebar.success(f"✅ Connected to Cloud DB: {len(tickers)} tickers loaded.")
+            st.write(f"Sample tickers: {tickers[:5]}...")
         else:
-            st.warning("BKNG did not meet all 5 criteria.")
+            st.error("Google Sheets missing 'Ticker' column. Please ensure your sheet has a column named 'Ticker'")
+            st.write("Available columns:", list(df_tickers.columns))
+            st.stop()
     else:
-        st.error("Could not fetch data for BKNG. Check ticker or connection.")
+        st.error("No data found in Google Sheets")
+        st.stop()
+        
+except Exception as e:
+    st.error(f"❌ Could not connect to Google Sheets: {str(e)}")
+    st.info("""
+    To fix this issue:
+    1. Create a `.streamlit/secrets.toml` file in your project directory
+    2. Add your Google Sheets connection details:
+    
+    ```toml
+    [connections.gsheets]
+    spreadsheet = "YOUR_SPREADSHEET_ID"
