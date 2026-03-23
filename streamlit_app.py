@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 from streamlit_gsheets import GSheetsConnection
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # ─────────────────────────────────────────────
 #  CONFIG  (mirrors standalone script exactly)
@@ -21,18 +21,31 @@ BATCH_SIZE        = 50
 # ─────────────────────────────────────────────
 #  STEP 1 — DATA DOWNLOAD  (batched, matches standalone)
 # ─────────────────────────────────────────────
-def download_batch(tickers: list[str]) -> dict[str, pd.DataFrame]:
+def download_batch(tickers: list[str],
+                   as_of_date: date = None) -> dict[str, pd.DataFrame]:
     """
     Batch download via yfinance — identical logic to standalone script.
     Handles both old (flat) and new (MultiIndex) yfinance column layouts.
     Returns { ticker: OHLCV DataFrame }.
+
+    as_of_date: if supplied, data is fetched up to and including that date,
+                with 1 year of history ending on that day.
+                Defaults to today (original behaviour).
     """
     if not tickers:
         return {}
 
+    # Determine date range
+    end_date   = as_of_date if as_of_date else date.today()
+    start_date = end_date - timedelta(days=365)
+
+    # yfinance end is exclusive, so add 1 day to include the as_of date itself
+    end_fetch  = end_date + timedelta(days=1)
+
     raw = yf.download(
         tickers,
-        period=HISTORY_PERIOD,
+        start=start_date.strftime("%Y-%m-%d"),
+        end=end_fetch.strftime("%Y-%m-%d"),
         interval=INTERVAL,
         group_by="ticker",
         auto_adjust=True,
@@ -303,6 +316,23 @@ batch_size = st.sidebar.number_input(
     help="Tickers downloaded per yfinance batch call (50 recommended)"
 )
 
+st.sidebar.markdown("---")
+as_of_date = st.sidebar.date_input(
+    "Run screener as of",
+    value=date.today(),
+    max_value=date.today(),
+    help="Evaluate signals as at close of this date. Cannot be a future date."
+)
+# Warn if a weekend or future date is selected
+if as_of_date > date.today():
+    st.sidebar.warning("Date cannot be in the future — defaulting to today.")
+    as_of_date = date.today()
+if as_of_date.weekday() >= 5:
+    st.sidebar.warning(
+        f"{as_of_date.strftime('%A %d %b %Y')} is a weekend. "
+        "yfinance will use the last available trading day on or before this date."
+    )
+
 run_button = st.sidebar.button("🚀 Run Screener")
 
 # --- Main scan loop ---
@@ -324,7 +354,7 @@ if run_button:
         )
 
         try:
-            price_data = download_batch(batch)
+            price_data = download_batch(batch, as_of_date=as_of_date)
         except Exception as e:
             for tkr in batch:
                 errors.append(f"{tkr}: batch download failed — {str(e)[:80]}")
@@ -343,7 +373,15 @@ if run_button:
                 continue
 
             try:
-                df            = calc_indicators(price_data[ticker])
+                raw_df = price_data[ticker]
+
+                # Slice to as_of_date so signals are evaluated at that day's close
+                as_of_ts = pd.Timestamp(as_of_date)
+                raw_df   = raw_df[raw_df.index <= as_of_ts]
+                if len(raw_df) < MA_SLOW + MA_CROSS_LOOKBACK + 2:
+                    continue
+
+                df            = calc_indicators(raw_df)
                 sig, days_ago = check_signals(df, cross_lookback=int(cross_window))
             except Exception as e:
                 errors.append(f"{ticker}: {str(e)[:120]}")
@@ -380,7 +418,7 @@ if run_button:
         with st.expander(f"⚠️ {len(errors)} ticker errors"):
             st.write("\n".join(errors[:30]))
 
-    st.header("📊 Results")
+    st.header(f"📊 Results — as of {as_of_date.strftime('%d %b %Y')}")
     col1, col2 = st.columns(2)
 
     with col1:
