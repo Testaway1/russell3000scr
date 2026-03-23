@@ -23,6 +23,42 @@ def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def crossover_within_n_days(ma_fast: pd.Series, ma_slow: pd.Series, n: int = 10) -> tuple[bool, bool, int]:
+    """
+    Check whether a MA crossover occurred within the last n candles.
+    Returns (bullish_cross, bearish_cross, days_ago)
+      bullish_cross = MA_fast crossed ABOVE MA_slow within n days
+      bearish_cross = MA_fast crossed BELOW MA_slow within n days
+      days_ago      = how many bars ago the most recent cross happened (-1 if none found)
+    """
+    if len(ma_fast) < 2 or len(ma_slow) < 2:
+        return False, False, -1
+
+    # Only look at the last n+1 bars (need i-1 to detect the cross at bar i)
+    lookback = min(n + 1, len(ma_fast))
+    fast = ma_fast.iloc[-lookback:].to_numpy(dtype=float)
+    slow = ma_slow.iloc[-lookback:].to_numpy(dtype=float)
+
+    bullish_cross = False
+    bearish_cross = False
+    days_ago = -1
+
+    for i in range(len(fast) - 1, 0, -1):
+        prev_above = fast[i - 1] > slow[i - 1]
+        curr_above = fast[i]     > slow[i]
+
+        if not prev_above and curr_above:        # fast crossed above slow
+            bullish_cross = True
+            days_ago = len(fast) - 1 - i         # 0 = today, 1 = yesterday, etc.
+            break
+        elif prev_above and not curr_above:      # fast crossed below slow
+            bearish_cross = True
+            days_ago = len(fast) - 1 - i
+            break
+
+    return bullish_cross, bearish_cross, days_ago
+
+
 def calc_supertrend(df: pd.DataFrame) -> np.ndarray | None:
     """
     Fix #2 — use numpy arrays throughout to avoid pandas SettingWithCopyWarning
@@ -141,6 +177,11 @@ if max_tickers > 0:
     tickers = tickers[:max_tickers]
     st.sidebar.info(f"Limited to {max_tickers} tickers")
 
+cross_window = st.sidebar.number_input(
+    "MA crossover window (days)", min_value=1, max_value=30, value=10,
+    help="Only show signals where MA10/MA20 crossed within this many days"
+)
+
 run_button = st.sidebar.button("🚀 Run Screener")
 
 # --- Main scan loop ---
@@ -187,30 +228,40 @@ if run_button:
 
             chg = (curr["Close"] - prev["Close"]) / prev["Close"] * 100
 
-            # Long: Supertrend bullish (1), MA10 > MA20, candle touched MA20 then closed above it bullish
+            # Check if the MA10/MA20 crossover happened within the last 10 days
+            bullish_cross, bearish_cross, days_ago = crossover_within_n_days(
+                df["MA10"], df["MA20"], n=cross_window
+            )
+
+            # Long: Supertrend bullish (1), MA10 > MA20 AND crossover < 10 days ago,
+            #        candle touched MA20 then closed above it as a bullish candle
             is_long = (
                 curr["dir"] == 1
                 and curr["MA10"] > curr["MA20"]
+                and bullish_cross                  # cross happened within 10 days
                 and curr["Low"]   <= curr["MA20"]
                 and curr["Close"] >  curr["MA20"]
                 and curr["Close"] >  curr["Open"]
             )
 
-            # Short: Supertrend bearish (-1), MA10 < MA20, candle touched MA20 then closed below it bearish
+            # Short: Supertrend bearish (-1), MA10 < MA20 AND crossover < 10 days ago,
+            #         candle touched MA20 then closed below it as a bearish candle
             is_short = (
                 curr["dir"] == -1
                 and curr["MA10"] < curr["MA20"]
+                and bearish_cross                  # cross happened within 10 days
                 and curr["High"]  >= curr["MA20"]
                 and curr["Close"] <  curr["MA20"]
                 and curr["Close"] <  curr["Open"]
             )
 
             row = {
-                "Ticker":   ticker,
-                "Price":    f"${curr['Close']:.2f}",
-                "MA10":     f"${curr['MA10']:.2f}",
-                "MA20":     f"${curr['MA20']:.2f}",
-                "Change %": f"{chg:.2f}%",
+                "Ticker":          ticker,
+                "Price":           f"${curr['Close']:.2f}",
+                "MA10":            f"${curr['MA10']:.2f}",
+                "MA20":            f"${curr['MA20']:.2f}",
+                "Change %":        f"{chg:.2f}%",
+                "Cross (days ago)": days_ago,
             }
 
             if is_long:
