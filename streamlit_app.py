@@ -4,384 +4,268 @@ import yfinance as yf
 import numpy as np
 from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
-import time
 
-# --- CONFIG & INDICATOR LOGIC ---
+# --- CONFIG ---
 ATR_PERIOD = 10
 FACTOR = 3.0
 MA_FAST = 10
 MA_SLOW = 20
 
-def calc_supertrend(df):
-    """Calculate Supertrend indicator"""
+
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fix #1 — yfinance ≥ 0.2.x returns a MultiIndex like (Field, Ticker).
+    Flatten to single-level column names so df["Close"] etc. always work.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        # Level 0 is the field name (Open/High/Low/Close/Volume)
+        df.columns = [col[0] for col in df.columns]
+    return df
+
+
+def calc_supertrend(df: pd.DataFrame) -> np.ndarray | None:
+    """
+    Fix #2 — use numpy arrays throughout to avoid pandas SettingWithCopyWarning
+              and silent no-op assignments that broke band tracking.
+    Fix #3 — corrected direction logic:
+              close > final_upper  → trend turns bearish  (-1)
+              close < final_lower  → trend turns bullish   (1)
+              otherwise persist previous direction
+    Returns an array where  1 = bullish,  -1 = bearish.
+    """
     try:
-        high = df["High"].values
-        low = df["Low"].values
-        close = df["Close"].values
-        
-        n = len(df)
-        
-        # Calculate True Range
-        tr = np.zeros(n)
+        high  = df["High"].to_numpy(dtype=float)
+        low   = df["Low"].to_numpy(dtype=float)
+        close = df["Close"].to_numpy(dtype=float)
+        n = len(close)
+
+        # --- True Range ---
+        tr = np.empty(n)
+        tr[0] = high[0] - low[0]
         for i in range(1, n):
             tr[i] = max(
                 high[i] - low[i],
-                abs(high[i] - close[i-1]),
-                abs(low[i] - close[i-1])
+                abs(high[i] - close[i - 1]),
+                abs(low[i]  - close[i - 1]),
             )
-        
-        # Calculate ATR using EMA
-        atr = np.zeros(n)
-        atr[0] = tr[0]
+
+        # --- ATR (EMA) ---
         alpha = 1.0 / ATR_PERIOD
+        atr = np.empty(n)
+        atr[0] = tr[0]
         for i in range(1, n):
-            atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
-        
-        # Calculate basic upper and lower bands
-        hl2 = (high + low) / 2.0
+            atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
+
+        # --- Basic bands ---
+        hl2         = (high + low) / 2.0
         basic_upper = hl2 + FACTOR * atr
         basic_lower = hl2 - FACTOR * atr
-        
-        # Initialize arrays
-        upper = np.zeros(n)
-        lower = np.zeros(n)
-        direction = np.ones(n)
-        
-        # Calculate final upper and lower bands and direction
-        for i in range(1, n):
-            # Upper band logic
-            if basic_upper[i] < upper[i-1] or close[i-1] > upper[i-1]:
-                upper[i] = basic_upper[i]
-            else:
-                upper[i] = upper[i-1]
-            
-            # Lower band logic
-            if basic_lower[i] > lower[i-1] or close[i-1] < lower[i-1]:
-                lower[i] = basic_lower[i]
-            else:
-                lower[i] = lower[i-1]
-            
-            # Direction logic
-            if direction[i-1] == 1:
-                direction[i] = 1 if close[i] <= upper[i] else -1
-            else:
-                direction[i] = -1 if close[i] >= lower[i] else -1
-        
-        return direction
-    except Exception as e:
-        st.error(f"Error in supertrend calculation: {e}")
-        return None
 
-# Alternative simpler supertrend implementation (if the above still has issues)
-def calc_supertrend_simple(df):
-    """Simplified Supertrend calculation"""
-    try:
-        # Calculate ATR
-        high = df['High']
-        low = df['Low']
-        close = df['Close']
-        
-        # True Range
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        
-        # ATR with EMA
-        atr = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
-        
-        # Basic bands
-        hl2 = (high + low) / 2
-        basic_upper = hl2 + (FACTOR * atr)
-        basic_lower = hl2 - (FACTOR * atr)
-        
-        # Initialize final bands
+        # --- Final bands (numpy arrays — no pandas copy issues) ---
         final_upper = basic_upper.copy()
         final_lower = basic_lower.copy()
-        
-        # Calculate final bands and direction
-        direction = pd.Series(1, index=df.index)
-        
-        for i in range(1, len(df)):
-            # Upper band
-            if basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1]:
-                final_upper.iloc[i] = basic_upper.iloc[i]
+        direction   = np.ones(n, dtype=int)   # start bullish
+
+        for i in range(1, n):
+            # Upper band: tighten unless previous close was above it
+            if basic_upper[i] < final_upper[i - 1] or close[i - 1] > final_upper[i - 1]:
+                final_upper[i] = basic_upper[i]
             else:
-                final_upper.iloc[i] = final_upper.iloc[i-1]
-            
-            # Lower band
-            if basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1]:
-                final_lower.iloc[i] = basic_lower.iloc[i]
+                final_upper[i] = final_upper[i - 1]
+
+            # Lower band: tighten unless previous close was below it
+            if basic_lower[i] > final_lower[i - 1] or close[i - 1] < final_lower[i - 1]:
+                final_lower[i] = basic_lower[i]
             else:
-                final_lower.iloc[i] = final_lower.iloc[i-1]
-            
-            # Direction
-            if direction.iloc[i-1] == 1:
-                if close.iloc[i] > final_upper.iloc[i]:
-                    direction.iloc[i] = -1
+                final_lower[i] = final_lower[i - 1]
+
+            # Direction — Fix #3: correct flip conditions
+            prev_dir = direction[i - 1]
+            if prev_dir == 1:          # currently bullish
+                if close[i] < final_lower[i]:
+                    direction[i] = -1  # flip bearish
                 else:
-                    direction.iloc[i] = 1
-            else:
-                if close.iloc[i] < final_lower.iloc[i]:
-                    direction.iloc[i] = 1
+                    direction[i] = 1   # stay bullish
+            else:                      # currently bearish
+                if close[i] > final_upper[i]:
+                    direction[i] = 1   # flip bullish
                 else:
-                    direction.iloc[i] = -1
-        
-        return direction.values
+                    direction[i] = -1  # stay bearish
+
+        return direction
+
     except Exception as e:
-        st.error(f"Error in simplified supertrend calculation: {e}")
+        st.error(f"Supertrend calculation error: {e}")
         return None
+
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Russell 3000 Screener", layout="wide")
 st.title("📈 Russell 3000 Cloud Screener")
 st.subheader("Supertrend + MA Confluence (Daily)")
 
-# Choose which supertrend implementation to use
-use_simple_supertrend = st.sidebar.checkbox("Use simplified supertrend (more stable)", value=True)
-
-# Debug section
-with st.expander("🔧 Connection Debug Info"):
-    st.write("Checking connection configuration...")
-    
-    # Show available secrets
-    try:
-        st.write("Secrets available:", list(st.secrets.keys()) if hasattr(st, 'secrets') else "No secrets found")
-    except:
-        st.write("Unable to access secrets")
-
-# Initialize Google Sheets Connection
+# --- Google Sheets connection ---
 try:
-    st.write("Attempting to connect to Google Sheets...")
     conn = st.connection("gsheets", type=GSheetsConnection)
-    
-    # Test the connection
-    df_tickers = conn.read(ttl="10m")
-    
-    if df_tickers is not None and not df_tickers.empty:
-        if "Ticker" in df_tickers.columns:
-            tickers = df_tickers["Ticker"].dropna().unique().tolist()
-            st.sidebar.success(f"✅ Connected to Cloud DB: {len(tickers)} tickers loaded.")
-            st.write(f"Sample tickers: {tickers[:5]}...")
-        else:
-            st.error("Google Sheets missing 'Ticker' column. Please ensure your sheet has a column named 'Ticker'")
-            st.write("Available columns:", list(df_tickers.columns))
-            st.stop()
-    else:
-        st.error("No data found in Google Sheets")
+    df_tickers = conn.read(ttl=600)   # Fix: ttl must be int (seconds), not "10m"
+
+    if df_tickers is None or df_tickers.empty:
+        st.error("No data found in Google Sheets.")
         st.stop()
-        
+
+    if "Ticker" not in df_tickers.columns:
+        st.error(f"Sheet is missing a 'Ticker' column. Found: {list(df_tickers.columns)}")
+        st.stop()
+
+    tickers = df_tickers["Ticker"].dropna().unique().tolist()
+    st.sidebar.success(f"✅ {len(tickers)} tickers loaded from Google Sheets.")
+
 except Exception as e:
-    st.error(f"❌ Could not connect to Google Sheets: {str(e)}")
-    st.info("To fix this issue:\n\n"
-            "1. Create a `.streamlit/secrets.toml` file in your project directory\n"
-            "2. Add your Google Sheets connection details:\n\n"
-            "```toml\n"
-            "[connections.gsheets]\n"
-            "spreadsheet = 'YOUR_SPREADSHEET_ID'\n"
-            "```\n\n"
-            "3. Make sure your Google Sheet has a column named 'Ticker' with the list of Russell 3000 tickers\n"
-            "4. If using Streamlit Cloud, add these secrets in the dashboard")
+    st.error(f"❌ Google Sheets connection failed: {e}")
+    st.info(
+        "Add a `.streamlit/secrets.toml` with:\n\n"
+        "```toml\n[connections.gsheets]\nspreadsheet = 'YOUR_SPREADSHEET_ID'\n```"
+    )
     st.stop()
 
-# User Controls
+# --- Sidebar controls ---
 st.sidebar.header("Screener Controls")
-run_button = st.sidebar.button("🚀 Run Screener")
 
-# Add sample tickers option for testing
 use_samples = st.sidebar.checkbox("Use sample tickers for testing")
 if use_samples:
-    sample_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "V", "WMT"]
-    tickers = sample_tickers
-    st.sidebar.success(f"Using {len(sample_tickers)} sample tickers for testing")
+    tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "NVDA", "JPM", "V", "WMT"]
+    st.sidebar.success(f"Using {len(tickers)} sample tickers")
 
-# Add option to limit number of tickers for faster testing
-max_tickers = st.sidebar.number_input("Max tickers to scan (0 = all)", min_value=0, max_value=500, value=0)
-if max_tickers > 0 and not use_samples:
+max_tickers = st.sidebar.number_input("Max tickers to scan (0 = all)", min_value=0, max_value=5000, value=0)
+if max_tickers > 0:
     tickers = tickers[:max_tickers]
-    st.sidebar.info(f"Limited to first {max_tickers} tickers")
+    st.sidebar.info(f"Limited to {max_tickers} tickers")
 
+run_button = st.sidebar.button("🚀 Run Screener")
+
+# --- Main scan loop ---
 if run_button:
-    long_hits = []
-    short_hits = []
-    errors = []
-    
-    # Create progress indicators
+    long_hits, short_hits, errors = [], [], []
+
     progress_bar = st.progress(0)
-    status_text = st.empty()
+    status_text  = st.empty()
     results_text = st.empty()
-    error_text = st.empty()
-    
-    total_tickers = len(tickers)
-    
+    total        = len(tickers)
+
     for idx, ticker in enumerate(tickers):
-        status_text.text(f"📊 Scanning {ticker} ({idx+1}/{total_tickers})")
-        progress_bar.progress((idx + 1) / total_tickers)
-        
+        status_text.text(f"📊 Scanning {ticker} ({idx + 1}/{total})")
+        progress_bar.progress((idx + 1) / total)
+
         try:
-            # Download data
-            df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-            
-            if df is None or len(df) < 30:
+            raw = yf.download(ticker, period="1y", interval="1d",
+                              progress=False, auto_adjust=True)
+
+            if raw is None or len(raw) < 30:
                 continue
-            
-            # Ensure we have the required columns
-            required_cols = ['Open', 'High', 'Low', 'Close']
-            if not all(col in df.columns for col in required_cols):
+
+            # Fix #1 — flatten MultiIndex columns
+            df = flatten_columns(raw.copy())
+
+            required = ["Open", "High", "Low", "Close"]
+            if not all(c in df.columns for c in required):
+                errors.append(f"{ticker}: missing columns after flatten ({list(df.columns)})")
                 continue
-            
-            # Calculate moving averages
+
             df["MA10"] = df["Close"].rolling(MA_FAST).mean()
             df["MA20"] = df["Close"].rolling(MA_SLOW).mean()
-            
-            # Calculate supertrend direction using selected method
-            if use_simple_supertrend:
-                direction = calc_supertrend_simple(df)
-            else:
-                direction = calc_supertrend(df)
-                
-            if direction is not None:
-                df["dir"] = direction
-            else:
+
+            direction = calc_supertrend(df)
+            if direction is None:
                 continue
-            
-            # Check if we have enough data
-            if len(df) < 2:
-                continue
-                
-            # Get current and previous data
+            df["dir"] = direction
+
             curr = df.iloc[-1]
             prev = df.iloc[-2]
-            
-            # Skip if any NaN values
-            if pd.isna(curr["MA10"]) or pd.isna(curr["MA20"]) or pd.isna(curr["dir"]):
+
+            if pd.isna(curr[["MA10", "MA20", "dir"]]).any():
                 continue
-            
-            # Long signal logic
-            try:
-                is_long = (
-                    curr["dir"] == -1 and 
-                    curr["MA10"] > curr["MA20"] and 
-                    curr["Low"] <= curr["MA20"] and 
-                    curr["Close"] > curr["MA20"] and
-                    curr["Close"] > curr["Open"]
-                )
-                
-                if is_long:
-                    long_hits.append({
-                        "Ticker": ticker, 
-                        "Price": f"${curr['Close']:.2f}",
-                        "MA10": f"${curr['MA10']:.2f}",
-                        "MA20": f"${curr['MA20']:.2f}",
-                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%",
-                        "Direction": "Bullish"
-                    })
-            except Exception as e:
-                st.warning(f"Error evaluating long signal for {ticker}: {str(e)}")
-            
-            # Short signal logic
-            try:
-                is_short = (
-                    curr["dir"] == 1 and 
-                    curr["MA10"] < curr["MA20"] and 
-                    curr["High"] >= curr["MA20"] and 
-                    curr["Close"] < curr["MA20"] and
-                    curr["Close"] < curr["Open"]
-                )
-                
-                if is_short:
-                    short_hits.append({
-                        "Ticker": ticker, 
-                        "Price": f"${curr['Close']:.2f}",
-                        "MA10": f"${curr['MA10']:.2f}",
-                        "MA20": f"${curr['MA20']:.2f}",
-                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%",
-                        "Direction": "Bearish"
-                    })
-            except Exception as e:
-                st.warning(f"Error evaluating short signal for {ticker}: {str(e)}")
-                
+
+            chg = (curr["Close"] - prev["Close"]) / prev["Close"] * 100
+
+            # Long: Supertrend bullish (1), MA10 > MA20, candle touched MA20 then closed above it bullish
+            is_long = (
+                curr["dir"] == 1
+                and curr["MA10"] > curr["MA20"]
+                and curr["Low"]   <= curr["MA20"]
+                and curr["Close"] >  curr["MA20"]
+                and curr["Close"] >  curr["Open"]
+            )
+
+            # Short: Supertrend bearish (-1), MA10 < MA20, candle touched MA20 then closed below it bearish
+            is_short = (
+                curr["dir"] == -1
+                and curr["MA10"] < curr["MA20"]
+                and curr["High"]  >= curr["MA20"]
+                and curr["Close"] <  curr["MA20"]
+                and curr["Close"] <  curr["Open"]
+            )
+
+            row = {
+                "Ticker":   ticker,
+                "Price":    f"${curr['Close']:.2f}",
+                "MA10":     f"${curr['MA10']:.2f}",
+                "MA20":     f"${curr['MA20']:.2f}",
+                "Change %": f"{chg:.2f}%",
+            }
+
+            if is_long:
+                long_hits.append({**row, "Direction": "Bullish"})
+            if is_short:
+                short_hits.append({**row, "Direction": "Bearish"})
+
         except Exception as e:
-            errors.append(f"{ticker}: {str(e)[:100]}")
-            continue
-        
-        # Update results in real-time
-        results_text.text(f"✅ Found: {len(long_hits)} long, {len(short_hits)} short signals")
-        
-        # Show errors if any
-        if errors and idx % 10 == 0:  # Show errors periodically
-            with error_text.container():
-                st.warning(f"Errors encountered: {len(errors)} tickers failed")
-    
-    status_text.text("✅ Scanning Complete!")
-    
-    # Show errors summary
+            errors.append(f"{ticker}: {str(e)[:120]}")
+
+        results_text.text(f"✅ Found: {len(long_hits)} long  |  {len(short_hits)} short")
+
+    status_text.text("✅ Scan complete!")
+
     if errors:
-        with st.expander(f"⚠️ Errors ({len(errors)} tickers)"):
-            st.write("\n".join(errors[:20]))  # Show first 20 errors
-    
-    # Display Results
-    st.header("📊 Screening Results")
-    
+        with st.expander(f"⚠️ {len(errors)} ticker errors"):
+            st.write("\n".join(errors[:30]))
+
+    st.header("📊 Results")
     col1, col2 = st.columns(2)
+
     with col1:
         st.subheader("🟢 Long Signals")
         if long_hits:
             df_long = pd.DataFrame(long_hits)
             st.dataframe(df_long, use_container_width=True)
-            st.success(f"Found {len(long_hits)} long signals")
-            
-            # Download button for long signals
-            csv_long = df_long.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Long Signals CSV",
-                data=csv_long,
-                file_name=f"long_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
+            st.download_button("📥 Download CSV", df_long.to_csv(index=False),
+                               f"long_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
         else:
             st.info("No long signals found.")
-            
+
     with col2:
         st.subheader("🔴 Short Signals")
         if short_hits:
             df_short = pd.DataFrame(short_hits)
             st.dataframe(df_short, use_container_width=True)
-            st.warning(f"Found {len(short_hits)} short signals")
-            
-            # Download button for short signals
-            csv_short = df_short.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Short Signals CSV",
-                data=csv_short,
-                file_name=f"short_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
+            st.download_button("📥 Download CSV", df_short.to_csv(index=False),
+                               f"short_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv")
         else:
             st.info("No short signals found.")
-    
-    # Summary statistics
+
     st.subheader("📈 Summary")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Tickers Scanned", total_tickers)
-    with col2:
-        st.metric("Long Signals", len(long_hits))
-    with col3:
-        st.metric("Short Signals", len(short_hits))
-    with col4:
-        success_rate = ((total_tickers - len(errors)) / total_tickers * 100) if total_tickers > 0 else 0
-        st.metric("Success Rate", f"{success_rate:.1f}%")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tickers Scanned",  total)
+    c2.metric("Long Signals",     len(long_hits))
+    c3.metric("Short Signals",    len(short_hits))
+    success_rate = (total - len(errors)) / total * 100 if total else 0
+    c4.metric("Success Rate",     f"{success_rate:.1f}%")
 
 else:
-    st.info("👈 Click 'Run Screener' in the sidebar to start processing the Russell 3000 list.")
-    
-    # Show sample of loaded tickers
-    if 'tickers' in locals() and tickers:
-        st.write(f"Loaded {len(tickers)} tickers from Google Sheets")
-        with st.expander("View first 20 tickers"):
+    st.info("👈 Click 'Run Screener' in the sidebar to start.")
+    if tickers:
+        st.write(f"Loaded {len(tickers)} tickers.")
+        with st.expander("First 20 tickers"):
             st.write(tickers[:20])
 
-# Add footer
 st.markdown("---")
-st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.caption(f"Last updated: {datetime.now():%Y-%m-%d %H:%M:%S}")
