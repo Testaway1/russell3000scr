@@ -15,74 +15,130 @@ MA_SLOW = 20
 def calc_supertrend(df):
     """Calculate Supertrend indicator"""
     try:
-        high = df["High"]
-        low = df["Low"]
-        close = df["Close"]
+        high = df["High"].values
+        low = df["Low"].values
+        close = df["Close"].values
         
-        # True Range - using vectorized operations
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
+        n = len(df)
         
-        # Create DataFrame with all three TR components and take max
-        tr_df = pd.DataFrame({
-            'tr1': tr1,
-            'tr2': tr2,
-            'tr3': tr3
-        })
-        tr = tr_df.max(axis=1)
+        # Calculate True Range
+        tr = np.zeros(n)
+        for i in range(1, n):
+            tr[i] = max(
+                high[i] - low[i],
+                abs(high[i] - close[i-1]),
+                abs(low[i] - close[i-1])
+            )
         
-        # Average True Range using EMA
-        atr = tr.ewm(alpha=1.0/ATR_PERIOD, adjust=False).mean()
+        # Calculate ATR using EMA
+        atr = np.zeros(n)
+        atr[0] = tr[0]
+        alpha = 1.0 / ATR_PERIOD
+        for i in range(1, n):
+            atr[i] = alpha * tr[i] + (1 - alpha) * atr[i-1]
         
-        # Basic Upper and Lower bands
+        # Calculate basic upper and lower bands
         hl2 = (high + low) / 2.0
         basic_upper = hl2 + FACTOR * atr
         basic_lower = hl2 - FACTOR * atr
         
-        # Initialize arrays for the loop
-        n = len(df)
+        # Initialize arrays
         upper = np.zeros(n)
         lower = np.zeros(n)
         direction = np.ones(n)
         
-        # Use scalar values in the loop (avoid Series comparisons)
+        # Calculate final upper and lower bands and direction
         for i in range(1, n):
-            # Convert to scalar values for comparison
-            basic_upper_i = basic_upper.iloc[i]
-            basic_lower_i = basic_lower.iloc[i]
-            upper_prev = upper[i-1]
-            lower_prev = lower[i-1]
-            close_prev = close.iloc[i-1]
-            close_i = close.iloc[i]
-            
-            # Upper band logic - using scalar comparisons
-            if basic_upper_i < upper_prev or close_prev > upper_prev:
-                upper[i] = basic_upper_i
+            # Upper band logic
+            if basic_upper[i] < upper[i-1] or close[i-1] > upper[i-1]:
+                upper[i] = basic_upper[i]
             else:
-                upper[i] = upper_prev
+                upper[i] = upper[i-1]
             
             # Lower band logic
-            if basic_lower_i > lower_prev or close_prev < lower_prev:
-                lower[i] = basic_lower_i
+            if basic_lower[i] > lower[i-1] or close[i-1] < lower[i-1]:
+                lower[i] = basic_lower[i]
             else:
-                lower[i] = lower_prev
+                lower[i] = lower[i-1]
             
             # Direction logic
             if direction[i-1] == 1:
-                direction[i] = 1 if close_i <= upper[i] else -1
+                direction[i] = 1 if close[i] <= upper[i] else -1
             else:
-                direction[i] = -1 if close_i >= lower[i] else 1
+                direction[i] = -1 if close[i] >= lower[i] else -1
         
         return direction
     except Exception as e:
         st.error(f"Error in supertrend calculation: {e}")
         return None
 
+# Alternative simpler supertrend implementation (if the above still has issues)
+def calc_supertrend_simple(df):
+    """Simplified Supertrend calculation"""
+    try:
+        # Calculate ATR
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        
+        # True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        # ATR with EMA
+        atr = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+        
+        # Basic bands
+        hl2 = (high + low) / 2
+        basic_upper = hl2 + (FACTOR * atr)
+        basic_lower = hl2 - (FACTOR * atr)
+        
+        # Initialize final bands
+        final_upper = basic_upper.copy()
+        final_lower = basic_lower.copy()
+        
+        # Calculate final bands and direction
+        direction = pd.Series(1, index=df.index)
+        
+        for i in range(1, len(df)):
+            # Upper band
+            if basic_upper.iloc[i] < final_upper.iloc[i-1] or close.iloc[i-1] > final_upper.iloc[i-1]:
+                final_upper.iloc[i] = basic_upper.iloc[i]
+            else:
+                final_upper.iloc[i] = final_upper.iloc[i-1]
+            
+            # Lower band
+            if basic_lower.iloc[i] > final_lower.iloc[i-1] or close.iloc[i-1] < final_lower.iloc[i-1]:
+                final_lower.iloc[i] = basic_lower.iloc[i]
+            else:
+                final_lower.iloc[i] = final_lower.iloc[i-1]
+            
+            # Direction
+            if direction.iloc[i-1] == 1:
+                if close.iloc[i] > final_upper.iloc[i]:
+                    direction.iloc[i] = -1
+                else:
+                    direction.iloc[i] = 1
+            else:
+                if close.iloc[i] < final_lower.iloc[i]:
+                    direction.iloc[i] = 1
+                else:
+                    direction.iloc[i] = -1
+        
+        return direction.values
+    except Exception as e:
+        st.error(f"Error in simplified supertrend calculation: {e}")
+        return None
+
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Russell 3000 Screener", layout="wide")
 st.title("📈 Russell 3000 Cloud Screener")
 st.subheader("Supertrend + MA Confluence (Daily)")
+
+# Choose which supertrend implementation to use
+use_simple_supertrend = st.sidebar.checkbox("Use simplified supertrend (more stable)", value=True)
 
 # Debug section
 with st.expander("🔧 Connection Debug Info"):
@@ -163,18 +219,8 @@ if run_button:
         progress_bar.progress((idx + 1) / total_tickers)
         
         try:
-            # Download data with error handling and retry logic
-            max_retries = 2
-            df = None
-            
-            for attempt in range(max_retries):
-                try:
-                    df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(1)
+            # Download data
+            df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
             
             if df is None or len(df) < 30:
                 continue
@@ -184,12 +230,16 @@ if run_button:
             if not all(col in df.columns for col in required_cols):
                 continue
             
-            # Calculate indicators
+            # Calculate moving averages
             df["MA10"] = df["Close"].rolling(MA_FAST).mean()
             df["MA20"] = df["Close"].rolling(MA_SLOW).mean()
             
-            # Calculate supertrend direction
-            direction = calc_supertrend(df)
+            # Calculate supertrend direction using selected method
+            if use_simple_supertrend:
+                direction = calc_supertrend_simple(df)
+            else:
+                direction = calc_supertrend(df)
+                
             if direction is not None:
                 df["dir"] = direction
             else:
@@ -223,7 +273,8 @@ if run_button:
                         "Price": f"${curr['Close']:.2f}",
                         "MA10": f"${curr['MA10']:.2f}",
                         "MA20": f"${curr['MA20']:.2f}",
-                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%"
+                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%",
+                        "Direction": "Bullish"
                     })
             except Exception as e:
                 st.warning(f"Error evaluating long signal for {ticker}: {str(e)}")
@@ -244,7 +295,8 @@ if run_button:
                         "Price": f"${curr['Close']:.2f}",
                         "MA10": f"${curr['MA10']:.2f}",
                         "MA20": f"${curr['MA20']:.2f}",
-                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%"
+                        "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%",
+                        "Direction": "Bearish"
                     })
             except Exception as e:
                 st.warning(f"Error evaluating short signal for {ticker}: {str(e)}")
@@ -278,6 +330,15 @@ if run_button:
             df_long = pd.DataFrame(long_hits)
             st.dataframe(df_long, use_container_width=True)
             st.success(f"Found {len(long_hits)} long signals")
+            
+            # Download button for long signals
+            csv_long = df_long.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Long Signals CSV",
+                data=csv_long,
+                file_name=f"long_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
         else:
             st.info("No long signals found.")
             
@@ -287,6 +348,15 @@ if run_button:
             df_short = pd.DataFrame(short_hits)
             st.dataframe(df_short, use_container_width=True)
             st.warning(f"Found {len(short_hits)} short signals")
+            
+            # Download button for short signals
+            csv_short = df_short.to_csv(index=False)
+            st.download_button(
+                label="📥 Download Short Signals CSV",
+                data=csv_short,
+                file_name=f"short_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv"
+            )
         else:
             st.info("No short signals found.")
     
