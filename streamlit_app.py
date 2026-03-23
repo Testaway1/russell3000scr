@@ -100,11 +100,148 @@ try:
         
 except Exception as e:
     st.error(f"❌ Could not connect to Google Sheets: {str(e)}")
-    st.info("""
-    To fix this issue:
-    1. Create a `.streamlit/secrets.toml` file in your project directory
-    2. Add your Google Sheets connection details:
+    st.info("To fix this issue:\n\n"
+            "1. Create a `.streamlit/secrets.toml` file in your project directory\n"
+            "2. Add your Google Sheets connection details:\n\n"
+            "```toml\n"
+            "[connections.gsheets]\n"
+            "spreadsheet = 'YOUR_SPREADSHEET_ID'\n"
+            "```\n\n"
+            "3. Make sure your Google Sheet has a column named 'Ticker' with the list of Russell 3000 tickers\n"
+            "4. If using Streamlit Cloud, add these secrets in the dashboard")
+    st.stop()
+
+# User Controls
+st.sidebar.header("Screener Controls")
+run_button = st.sidebar.button("🚀 Run Screener")
+
+# Add sample tickers option for testing
+if st.sidebar.checkbox("Use sample tickers for testing"):
+    sample_tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+    tickers = sample_tickers
+    st.sidebar.info(f"Using sample tickers: {sample_tickers}")
+
+if run_button:
+    long_hits = []
+    short_hits = []
     
-    ```toml
-    [connections.gsheets]
-    spreadsheet = "YOUR_SPREADSHEET_ID"
+    # Create progress indicators
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_text = st.empty()
+    
+    total_tickers = len(tickers)
+    
+    for idx, ticker in enumerate(tickers):
+        status_text.text(f"📊 Scanning {ticker} ({idx+1}/{total_tickers})")
+        progress_bar.progress((idx + 1) / total_tickers)
+        
+        try:
+            # Download data with error handling
+            df = yf.download(ticker, period="1y", interval="1d", progress=False, auto_adjust=True)
+            
+            if len(df) < 30:
+                continue
+            
+            # Calculate indicators
+            df["MA10"] = df["Close"].rolling(MA_FAST).mean()
+            df["MA20"] = df["Close"].rolling(MA_SLOW).mean()
+            
+            # Calculate supertrend direction
+            direction = calc_supertrend(df)
+            if direction is not None:
+                df["dir"] = direction
+            
+            # Get current and previous data
+            curr = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Long signal logic
+            is_long = (
+                curr["dir"] == -1 and 
+                curr["MA10"] > curr["MA20"] and 
+                curr["Low"] <= curr["MA20"] and 
+                curr["Close"] > curr["MA20"] and
+                curr["Close"] > curr["Open"]
+            )
+            
+            if is_long:
+                long_hits.append({
+                    "Ticker": ticker, 
+                    "Price": f"${curr['Close']:.2f}",
+                    "MA10": f"${curr['MA10']:.2f}",
+                    "MA20": f"${curr['MA20']:.2f}",
+                    "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%"
+                })
+            
+            # Short signal logic
+            is_short = (
+                curr["dir"] == 1 and 
+                curr["MA10"] < curr["MA20"] and 
+                curr["High"] >= curr["MA20"] and 
+                curr["Close"] < curr["MA20"] and
+                curr["Close"] < curr["Open"]
+            )
+            
+            if is_short:
+                short_hits.append({
+                    "Ticker": ticker, 
+                    "Price": f"${curr['Close']:.2f}",
+                    "MA10": f"${curr['MA10']:.2f}",
+                    "MA20": f"${curr['MA20']:.2f}",
+                    "Change %": f"{((curr['Close'] - prev['Close'])/prev['Close']*100):.2f}%"
+                })
+                
+        except Exception as e:
+            st.warning(f"Error processing {ticker}: {str(e)}")
+            continue
+        
+        # Update results in real-time
+        results_text.text(f"Found: {len(long_hits)} long signals, {len(short_hits)} short signals")
+    
+    status_text.text("✅ Scanning Complete!")
+    
+    # Display Results
+    st.header("📊 Screening Results")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("🟢 Long Signals")
+        if long_hits:
+            df_long = pd.DataFrame(long_hits)
+            st.dataframe(df_long, use_container_width=True)
+            st.success(f"Found {len(long_hits)} long signals")
+        else:
+            st.info("No long signals found.")
+            
+    with col2:
+        st.subheader("🔴 Short Signals")
+        if short_hits:
+            df_short = pd.DataFrame(short_hits)
+            st.dataframe(df_short, use_container_width=True)
+            st.warning(f"Found {len(short_hits)} short signals")
+        else:
+            st.info("No short signals found.")
+    
+    # Summary statistics
+    st.subheader("📈 Summary")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Total Tickers Scanned", total_tickers)
+    with col2:
+        st.metric("Long Signals", len(long_hits))
+    with col3:
+        st.metric("Short Signals", len(short_hits))
+
+else:
+    st.info("👈 Click 'Run Screener' in the sidebar to start processing the Russell 3000 list.")
+    
+    # Show sample of loaded tickers
+    if 'tickers' in locals() and tickers:
+        st.write(f"Loaded {len(tickers)} tickers from Google Sheets")
+        with st.expander("View first 20 tickers"):
+            st.write(tickers[:20])
+
+# Add footer
+st.markdown("---")
+st.caption(f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
