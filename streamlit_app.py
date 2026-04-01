@@ -17,7 +17,6 @@ HISTORY_PERIOD    = "1y"
 INTERVAL          = "1d"
 BATCH_SIZE        = 50
 
-
 # ─────────────────────────────────────────────
 #  STEP 1 — DATA DOWNLOAD  (batched, matches standalone)
 # ─────────────────────────────────────────────
@@ -27,7 +26,6 @@ def download_batch(tickers: list[str],
     Batch download via yfinance — identical logic to standalone script.
     Handles both old (flat) and new (MultiIndex) yfinance column layouts.
     Returns { ticker: OHLCV DataFrame }.
-
     as_of_date: if supplied, data is fetched up to and including that date,
                 with 1 year of history ending on that day.
                 Defaults to today (original behaviour).
@@ -38,7 +36,6 @@ def download_batch(tickers: list[str],
     # Determine date range
     end_date   = as_of_date if as_of_date else date.today()
     start_date = end_date - timedelta(days=365)
-
     # yfinance end is exclusive, so add 1 day to include the as_of date itself
     end_fetch  = end_date + timedelta(days=1)
 
@@ -108,15 +105,9 @@ def calc_supertrend(df: pd.DataFrame,
                     factor: float   = FACTOR) -> pd.Series | None:
     """
     Matches Pine Script ta.supertrend() — identical to standalone script.
-
     Convention (same as Pine Script):
         direction = -1  →  Uptrend   (price above Supertrend line)
         direction = +1  →  Downtrend (price below Supertrend line)
-
-    Changes from previous Streamlit version:
-      1. ATR via pandas ewm(alpha=1/period, adjust=False) — matches Pine Script
-      2. st_line tracker used for flip logic — matches Pine Script exactly
-      3. Direction convention corrected to -1/+1 (was 1/-1)
     """
     try:
         high  = df["High"]
@@ -147,19 +138,16 @@ def calc_supertrend(df: pd.DataFrame,
                 final_upper[i] = basic_upper.iloc[i]
             else:
                 final_upper[i] = final_upper[i-1]
-
             # Lower band
             if basic_lower.iloc[i] > final_lower[i-1] or close.iloc[i-1] < final_lower[i-1]:
                 final_lower[i] = basic_lower.iloc[i]
             else:
                 final_lower[i] = final_lower[i-1]
-
             # Direction via st_line — matches Pine Script logic exactly
             if st_line[i-1] == final_upper[i-1]:
                 direction[i] = 1 if close.iloc[i] <= final_upper[i] else -1
             else:
                 direction[i] = -1 if close.iloc[i] >= final_lower[i] else 1
-
             st_line[i] = final_lower[i] if direction[i] == -1 else final_upper[i]
 
         return pd.Series(direction, index=df.index, name="direction")
@@ -245,7 +233,6 @@ def check_signals(df: pd.DataFrame,
         and close >  ma_slow
         and close >  open_
     )
-
     short_signal = (
         direction == 1         # Downtrend (Pine Script convention)
         and ma_fast < ma_slow
@@ -261,6 +248,34 @@ def check_signals(df: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────
+#  STEP 6 — SPY REGIME CHECK
+# ─────────────────────────────────────────────
+def get_spy_regime(as_of_date: date) -> bool | None:
+    """
+    Returns True  if SPY MA10 > MA20 on as_of_date (regime bullish — longs allowed).
+    Returns False if SPY MA10 <= MA20 (regime bearish — longs suppressed).
+    Returns None  if SPY data is unavailable (filter disabled for this run).
+    """
+    try:
+        spy_data = download_batch(["SPY"], as_of_date=as_of_date)
+        if "SPY" not in spy_data:
+            return None
+        df       = spy_data["SPY"]
+        as_of_ts = pd.Timestamp(as_of_date)
+        df       = df[df.index <= as_of_ts]
+        if len(df) < MA_SLOW + 2:
+            return None
+        df["ma_fast"] = df["Close"].rolling(MA_FAST).mean()
+        df["ma_slow"] = df["Close"].rolling(MA_SLOW).mean()
+        last = df.iloc[-1]
+        if pd.isna(last["ma_fast"]) or pd.isna(last["ma_slow"]):
+            return None
+        return bool(last["ma_fast"] > last["ma_slow"])
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
 #  STREAMLIT UI
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Russell 3000 Screener", layout="wide")
@@ -271,18 +286,14 @@ st.subheader("Supertrend + MA Confluence (Daily)")
 try:
     conn       = st.connection("gsheets", type=GSheetsConnection)
     df_tickers = conn.read(ttl=600)
-
     if df_tickers is None or df_tickers.empty:
         st.error("No data found in Google Sheets.")
         st.stop()
-
     if "Ticker" not in df_tickers.columns:
         st.error(f"Sheet is missing a 'Ticker' column. Found: {list(df_tickers.columns)}")
         st.stop()
-
     tickers = df_tickers["Ticker"].dropna().unique().tolist()
     st.sidebar.success(f"✅ {len(tickers)} tickers loaded from Google Sheets.")
-
 except Exception as e:
     st.error(f"❌ Google Sheets connection failed: {e}")
     st.info(
@@ -317,12 +328,14 @@ batch_size = st.sidebar.number_input(
 )
 
 st.sidebar.markdown("---")
+
 as_of_date = st.sidebar.date_input(
     "Run screener as of",
     value=date.today(),
     max_value=date.today(),
     help="Evaluate signals as at close of this date. Cannot be a future date."
 )
+
 # Warn if a weekend or future date is selected
 if as_of_date > date.today():
     st.sidebar.warning("Date cannot be in the future — defaulting to today.")
@@ -334,6 +347,18 @@ if as_of_date.weekday() >= 5:
     )
 
 st.sidebar.markdown("---")
+
+# --- SPY Regime Filter ---
+st.sidebar.subheader("📡 SPY Regime Filter")
+use_spy_regime = st.sidebar.checkbox(
+    "SPY Regime Filter (MA10 > MA20)",
+    value=True,
+    help="Only show LONG signals when SPY 10-day MA is above 20-day MA on the signal date."
+)
+
+st.sidebar.markdown("---")
+
+# --- Capital Allocation ---
 st.sidebar.subheader("💰 Capital Allocation")
 capital = st.sidebar.number_input(
     "Total capital ($)",
@@ -353,6 +378,7 @@ max_position_pct = st.sidebar.number_input(
     min_value=1.0, max_value=100.0, value=20.0, step=1.0,
     help="Maximum $ allocated to a single position, as a % of capital. Default 20%."
 )
+
 max_risk_dollars     = capital * (max_risk_pct     / 100)
 max_position_dollars = capital * (max_position_pct / 100)
 
@@ -361,11 +387,22 @@ run_button = st.sidebar.button("🚀 Run Screener")
 # --- Main scan loop ---
 if run_button:
     long_hits, short_hits, errors = [], [], []
-
     batches       = [tickers[i : i + int(batch_size)] for i in range(0, len(tickers), int(batch_size))]
     total         = len(tickers)
     total_batches = len(batches)
     tickers_done  = 0
+
+    # ── SPY regime check ──────────────────────────────────────────────────────
+    spy_regime_ok = None
+    if use_spy_regime:
+        with st.spinner("Checking SPY regime (MA10 vs MA20)…"):
+            spy_regime_ok = get_spy_regime(as_of_date)
+        if spy_regime_ok is None:
+            st.warning("⚠️ Could not fetch SPY data — regime filter disabled for this run.")
+        elif spy_regime_ok:
+            st.success("✅ SPY regime: BULLISH (MA10 > MA20) — long signals enabled.")
+        else:
+            st.warning("🚫 SPY regime: BEARISH (MA10 ≤ MA20) — long signals suppressed.")
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
@@ -375,7 +412,6 @@ if run_button:
         status_text.text(
             f"📦 Downloading batch {b_idx + 1}/{total_batches} ({len(batch)} tickers)…"
         )
-
         try:
             price_data = download_batch(batch, as_of_date=as_of_date)
         except Exception as e:
@@ -397,13 +433,11 @@ if run_button:
 
             try:
                 raw_df = price_data[ticker]
-
                 # Slice to as_of_date so signals are evaluated at that day's close
                 as_of_ts = pd.Timestamp(as_of_date)
                 raw_df   = raw_df[raw_df.index <= as_of_ts]
                 if len(raw_df) < MA_SLOW + MA_CROSS_LOOKBACK + 2:
                     continue
-
                 df            = calc_indicators(raw_df)
                 sig, days_ago = check_signals(df, cross_lookback=int(cross_window))
             except Exception as e:
@@ -419,8 +453,7 @@ if run_button:
             price = float(last["Close"])
             sl    = float(last["Low"])    # stop loss = low of signal bar
 
-            # ── Position sizing ──────────────────────────────────────────────
-            # Risk-based shares: risk $max_risk_dollars, stop = price - sl
+            # ── Position sizing ───────────────────────────────────────────────
             risk_per_share = price - sl
             if risk_per_share > 0:
                 shares_by_risk     = max_risk_dollars / risk_per_share
@@ -448,7 +481,11 @@ if run_button:
             }
 
             if sig == "LONG":
-                long_hits.append(row)
+                # Gate on SPY regime — skip if filter is on and regime is bearish
+                if use_spy_regime and spy_regime_ok is False:
+                    pass   # regime bearish — suppress long signal
+                else:
+                    long_hits.append(row)
             else:
                 short_hits.append(row)
 
@@ -461,6 +498,17 @@ if run_button:
             st.write("\n".join(errors[:30]))
 
     st.header(f"📊 Results — as of {as_of_date.strftime('%d %b %Y')}")
+
+    # ── SPY regime status banner ──────────────────────────────────────────────
+    if use_spy_regime:
+        if spy_regime_ok is True:
+            st.info("📡 SPY Regime: **BULLISH** (MA10 > MA20) — long signals shown.")
+        elif spy_regime_ok is False:
+            st.warning("📡 SPY Regime: **BEARISH** (MA10 ≤ MA20) — long signals suppressed.")
+        else:
+            st.warning("📡 SPY Regime: **UNAVAILABLE** — regime filter was bypassed.")
+    else:
+        st.info("📡 SPY Regime Filter: **OFF** — all long signals shown regardless of market.")
 
     # ── Summary metrics ───────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
@@ -483,19 +531,14 @@ if run_button:
     st.subheader("🟢 Long Signals")
     if long_hits:
         df_long = pd.DataFrame(long_hits)
-
-        # Display column order
         display_cols = [
             "Ticker", "Date", "Price ($)", "Stop Loss ($)",
             "Shares", "Position ($)", "Risk ($)",
             "MA10 ($)", "MA20 ($)", "Change %", "Cross (days ago)",
         ]
         df_display = df_long[display_cols].copy()
-
-        # Format for display
         fmt_dollar = ["Price ($)", "Stop Loss ($)", "MA10 ($)", "MA20 ($)"]
         fmt_money  = ["Position ($)", "Risk ($)"]
-
         st.dataframe(
             df_display.style
                 .format({c: "${:,.2f}" for c in fmt_dollar})
@@ -524,7 +567,10 @@ if run_button:
             "text/csv",
         )
     else:
-        st.info("No long signals found.")
+        if use_spy_regime and spy_regime_ok is False:
+            st.info("No long signals shown — SPY regime is bearish.")
+        else:
+            st.info("No long signals found.")
 
 else:
     st.info("👈 Click 'Run Screener' in the sidebar to start.")
