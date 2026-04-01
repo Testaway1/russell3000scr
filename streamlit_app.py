@@ -255,23 +255,47 @@ def get_spy_regime(as_of_date: date) -> bool | None:
     Returns True  if SPY MA10 > MA20 on as_of_date (regime bullish — longs allowed).
     Returns False if SPY MA10 <= MA20 (regime bearish — longs suppressed).
     Returns None  if SPY data is unavailable (filter disabled for this run).
+    Uses a direct yf.download call (not download_batch) to avoid the
+    ATR/minimum-bar filter that would discard SPY.
     """
     try:
-        spy_data = download_batch(["SPY"], as_of_date=as_of_date)
-        if "SPY" not in spy_data:
+        end_date   = as_of_date
+        start_date = end_date - timedelta(days=90)   # 90 days — plenty for MA20
+        end_fetch  = end_date + timedelta(days=1)
+
+        raw = yf.download(
+            "SPY",
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_fetch.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
+
+        if raw is None or raw.empty:
             return None
-        df       = spy_data["SPY"]
+
+        # Flatten MultiIndex if present (newer yfinance versions)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+        raw      = raw.dropna(subset=["Close"])
         as_of_ts = pd.Timestamp(as_of_date)
-        df       = df[df.index <= as_of_ts]
-        if len(df) < MA_SLOW + 2:
+        raw      = raw[raw.index <= as_of_ts]
+
+        if len(raw) < MA_SLOW + 2:
             return None
-        df["ma_fast"] = df["Close"].rolling(MA_FAST).mean()
-        df["ma_slow"] = df["Close"].rolling(MA_SLOW).mean()
-        last = df.iloc[-1]
-        if pd.isna(last["ma_fast"]) or pd.isna(last["ma_slow"]):
+
+        ma_fast = raw["Close"].rolling(MA_FAST).mean().iloc[-1]
+        ma_slow = raw["Close"].rolling(MA_SLOW).mean().iloc[-1]
+
+        if pd.isna(ma_fast) or pd.isna(ma_slow):
             return None
-        return bool(last["ma_fast"] > last["ma_slow"])
-    except Exception:
+
+        return bool(ma_fast > ma_slow)
+
+    except Exception as e:
+        st.warning(f"SPY regime fetch error: {e}")
         return None
 
 
