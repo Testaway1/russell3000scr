@@ -6,37 +6,32 @@ from streamlit_gsheets import GSheetsConnection
 from datetime import datetime, date, timedelta
 
 # ─────────────────────────────────────────────
-#  CONFIG  (mirrors standalone script exactly)
+#  CONFIG
 # ─────────────────────────────────────────────
 ATR_PERIOD        = 10
 FACTOR            = 3.0
 MA_FAST           = 10
 MA_SLOW           = 20
+MA_TREND          = 200
 MA_CROSS_LOOKBACK = 10
-HISTORY_PERIOD    = "1y"
 INTERVAL          = "1d"
 BATCH_SIZE        = 50
+LOOKBACK_52W      = 252
+
+SHORT_DIST_MIN    = 40.0           # short filter: >40% below 52w high
+SHORT_CHANGE_MAX  = -50.0          # short filter: down >50% on year
+
 
 # ─────────────────────────────────────────────
-#  STEP 1 — DATA DOWNLOAD  (batched, matches standalone)
+#  DATA DOWNLOAD
 # ─────────────────────────────────────────────
 def download_batch(tickers: list[str],
                    as_of_date: date = None) -> dict[str, pd.DataFrame]:
-    """
-    Batch download via yfinance — identical logic to standalone script.
-    Handles both old (flat) and new (MultiIndex) yfinance column layouts.
-    Returns { ticker: OHLCV DataFrame }.
-    as_of_date: if supplied, data is fetched up to and including that date,
-                with 1 year of history ending on that day.
-                Defaults to today (original behaviour).
-    """
     if not tickers:
         return {}
 
-    # Determine date range
     end_date   = as_of_date if as_of_date else date.today()
-    start_date = end_date - timedelta(days=365)
-    # yfinance end is exclusive, so add 1 day to include the as_of date itself
+    start_date = end_date - timedelta(days=730)   # 2y for MA200 + 52w warmup
     end_fetch  = end_date + timedelta(days=1)
 
     raw = yf.download(
@@ -50,29 +45,28 @@ def download_batch(tickers: list[str],
         threads=True,
     )
 
-    result = {}
+    result   = {}
+    min_bars = MA_SLOW + ATR_PERIOD + 5
+
     if raw.empty:
         return result
 
-    # ── Single ticker — flat columns ──────────────────────────────────────────
     if len(tickers) == 1:
         tkr = tickers[0]
         try:
             df = raw.dropna()
-            if len(df) >= MA_SLOW + ATR_PERIOD + 5:
+            if len(df) >= min_bars:
                 result[tkr] = df
         except Exception:
             pass
         return result
 
-    # ── Multi-ticker — MultiIndex columns ─────────────────────────────────────
     cols = raw.columns
     if not isinstance(cols, pd.MultiIndex):
         try:
-            tkr = tickers[0]
-            df  = raw.dropna()
-            if len(df) >= MA_SLOW + ATR_PERIOD + 5:
-                result[tkr] = df
+            df = raw.dropna()
+            if len(df) >= min_bars:
+                result[tickers[0]] = df
         except Exception:
             pass
         return result
@@ -89,7 +83,7 @@ def download_batch(tickers: list[str],
             sub = raw[tkr_cols].copy()
             sub.columns = sub.columns.get_level_values(field_level)
             sub = sub.dropna()
-            if len(sub) >= MA_SLOW + ATR_PERIOD + 5:
+            if len(sub) >= min_bars:
                 result[tkr] = sub
         except Exception:
             continue
@@ -98,23 +92,16 @@ def download_batch(tickers: list[str],
 
 
 # ─────────────────────────────────────────────
-#  STEP 2 — SUPERTREND  (matches Pine Script ta.supertrend())
+#  SUPERTREND
 # ─────────────────────────────────────────────
 def calc_supertrend(df: pd.DataFrame,
                     atr_period: int = ATR_PERIOD,
                     factor: float   = FACTOR) -> pd.Series | None:
-    """
-    Matches Pine Script ta.supertrend() — identical to standalone script.
-    Convention (same as Pine Script):
-        direction = -1  →  Uptrend   (price above Supertrend line)
-        direction = +1  →  Downtrend (price below Supertrend line)
-    """
     try:
         high  = df["High"]
         low   = df["Low"]
         close = df["Close"]
 
-        # ATR — pandas EMA, matches Pine Script / standalone
         tr = pd.concat([
             high - low,
             (high - close.shift(1)).abs(),
@@ -129,21 +116,18 @@ def calc_supertrend(df: pd.DataFrame,
         n           = len(df)
         final_upper = np.zeros(n)
         final_lower = np.zeros(n)
-        direction   = np.ones(n)      # +1 = Downtrend (Pine Script convention)
-        st_line     = np.zeros(n)     # tracks actual Supertrend line level
+        direction   = np.ones(n)
+        st_line     = np.zeros(n)
 
         for i in range(1, n):
-            # Upper band
             if basic_upper.iloc[i] < final_upper[i-1] or close.iloc[i-1] > final_upper[i-1]:
                 final_upper[i] = basic_upper.iloc[i]
             else:
                 final_upper[i] = final_upper[i-1]
-            # Lower band
             if basic_lower.iloc[i] > final_lower[i-1] or close.iloc[i-1] < final_lower[i-1]:
                 final_lower[i] = basic_lower.iloc[i]
             else:
                 final_lower[i] = final_lower[i-1]
-            # Direction via st_line — matches Pine Script logic exactly
             if st_line[i-1] == final_upper[i-1]:
                 direction[i] = 1 if close.iloc[i] <= final_upper[i] else -1
             else:
@@ -153,35 +137,30 @@ def calc_supertrend(df: pd.DataFrame,
         return pd.Series(direction, index=df.index, name="direction")
 
     except Exception as e:
-        st.error(f"Supertrend calculation error: {e}")
+        st.error(f"Supertrend error: {e}")
         return None
 
 
 # ─────────────────────────────────────────────
-#  STEP 3 — INDICATORS
+#  INDICATORS
 # ─────────────────────────────────────────────
 def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ma_fast"]   = df["Close"].rolling(MA_FAST).mean()
-    df["ma_slow"]   = df["Close"].rolling(MA_SLOW).mean()
+    df["ma_fast"]      = df["Close"].rolling(MA_FAST).mean()
+    df["ma_slow"]      = df["Close"].rolling(MA_SLOW).mean()
+    df["ma_trend"]     = df["Close"].rolling(MA_TREND).mean()
+    df["high_52w"]     = df["Close"].rolling(LOOKBACK_52W).max()
+    df["close_252ago"] = df["Close"].shift(LOOKBACK_52W)
     result = calc_supertrend(df, ATR_PERIOD, FACTOR)
-    if result is not None:
-        df["direction"] = result.values
-    else:
-        df["direction"] = np.nan
+    df["direction"] = result.values if result is not None else np.nan
     return df
 
 
 # ─────────────────────────────────────────────
-#  STEP 4 — MA CROSSOVER CHECK  (matches standalone)
+#  MA CROSSOVER CHECK
 # ─────────────────────────────────────────────
-def ma_cross_within(df: pd.DataFrame, bars: int = MA_CROSS_LOOKBACK) -> tuple[bool, bool, int]:
-    """
-    Identical logic to standalone script's ma_cross_within().
-    Scans backwards up to `bars` candles for the most recent MA crossover.
-    Returns (bullish_cross, bearish_cross, days_ago).
-    days_ago = bars back from last bar where cross occurred (-1 if none found).
-    """
+def ma_cross_within(df: pd.DataFrame,
+                    bars: int = MA_CROSS_LOOKBACK) -> tuple[bool, bool, int]:
     fast     = df["ma_fast"].values
     slow     = df["ma_slow"].values
     last_bar = len(df) - 1
@@ -189,78 +168,88 @@ def ma_cross_within(df: pd.DataFrame, bars: int = MA_CROSS_LOOKBACK) -> tuple[bo
     for i in range(last_bar, 0, -1):
         if (last_bar - i) > bars:
             break
-        if pd.isna(fast[i]) or pd.isna(slow[i]) or pd.isna(fast[i-1]) or pd.isna(slow[i-1]):
+        if any(pd.isna(v) for v in [fast[i], slow[i], fast[i-1], slow[i-1]]):
             continue
-        if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:   # bullish cross
+        if fast[i-1] <= slow[i-1] and fast[i] > slow[i]:
             return True, False, last_bar - i
-        if fast[i-1] >= slow[i-1] and fast[i] < slow[i]:   # bearish cross
+        if fast[i-1] >= slow[i-1] and fast[i] < slow[i]:
             return False, True, last_bar - i
 
     return False, False, -1
 
 
 # ─────────────────────────────────────────────
-#  STEP 5 — SIGNAL DETECTION  (matches standalone exactly)
+#  LONG SIGNAL DETECTION
 # ─────────────────────────────────────────────
-def check_signals(df: pd.DataFrame,
-                  cross_lookback: int = MA_CROSS_LOOKBACK) -> tuple[str | None, int]:
-    """
-    Returns (signal, days_ago) where signal is 'LONG', 'SHORT', or None.
-    Direction convention: -1 = Uptrend, +1 = Downtrend (Pine Script).
-    """
+def check_long_signal(df: pd.DataFrame,
+                      cross_lookback: int = MA_CROSS_LOOKBACK) -> tuple[bool, int]:
     if len(df) < MA_SLOW + cross_lookback + 2:
-        return None, -1
+        return False, -1
 
     row = df.iloc[-1]
-    if pd.isna(row["ma_fast"]) or pd.isna(row["ma_slow"]) or pd.isna(row["direction"]):
-        return None, -1
+    if any(pd.isna(row.get(c, float("nan")))
+           for c in ["ma_fast", "ma_slow", "direction"]):
+        return False, -1
 
-    direction = row["direction"]
-    ma_fast   = row["ma_fast"]
-    ma_slow   = row["ma_slow"]
-    open_     = row["Open"]
-    close     = row["Close"]
-    high      = row["High"]
-    low       = row["Low"]
+    bullish_cross, _, days_ago = ma_cross_within(df, cross_lookback)
 
-    bullish_cross, bearish_cross, days_ago = ma_cross_within(df, cross_lookback)
-
-    long_signal = (
-        direction == -1        # Uptrend  (Pine Script convention)
-        and ma_fast > ma_slow
+    signal = (
+        row["direction"] == -1
+        and row["ma_fast"]  > row["ma_slow"]
         and bullish_cross
-        and low   <= ma_slow
-        and close >  ma_slow
-        and close >  open_
+        and row["Low"]     <= row["ma_slow"]
+        and row["Close"]    > row["ma_slow"]
+        and row["Close"]    > row["Open"]
     )
-    short_signal = (
-        direction == 1         # Downtrend (Pine Script convention)
-        and ma_fast < ma_slow
-        and bearish_cross
-        and high  >= ma_slow
-        and close <  ma_slow
-        and close <  open_
-    )
-
-    if long_signal:  return "LONG",  days_ago
-    if short_signal: return "SHORT", days_ago
-    return None, -1
+    return signal, days_ago
 
 
 # ─────────────────────────────────────────────
-#  STEP 6 — SPY REGIME CHECK
+#  SHORT SIGNAL DETECTION
+# ─────────────────────────────────────────────
+def check_short_signal(df: pd.DataFrame,
+                       cross_lookback: int = MA_CROSS_LOOKBACK) -> tuple[bool, int, float, float]:
+    if len(df) < MA_TREND + MA_CROSS_LOOKBACK + 5:
+        return False, -1, 0.0, 0.0
+
+    row = df.iloc[-1]
+    for col in ["ma_fast", "ma_slow", "direction", "high_52w", "close_252ago"]:
+        if pd.isna(row.get(col, float("nan"))):
+            return False, -1, 0.0, 0.0
+
+    price        = float(row["Close"])
+    high_52w     = float(row["high_52w"])
+    close_252ago = float(row["close_252ago"])
+
+    if high_52w <= 0 or close_252ago <= 0:
+        return False, -1, 0.0, 0.0
+
+    dist_pct   = (high_52w - price) / high_52w * 100.0
+    change_pct = (price - close_252ago) / close_252ago * 100.0
+
+    if dist_pct < SHORT_DIST_MIN or change_pct >= SHORT_CHANGE_MAX:
+        return False, -1, round(dist_pct, 1), round(change_pct, 1)
+
+    _, bearish_cross, days_ago = ma_cross_within(df, cross_lookback)
+
+    signal = (
+        row["direction"] == 1
+        and row["ma_fast"]  < row["ma_slow"]
+        and bearish_cross
+        and row["High"]    >= row["ma_slow"]
+        and row["Close"]    < row["ma_slow"]
+        and row["Close"]    < row["Open"]
+    )
+    return signal, days_ago, round(dist_pct, 1), round(change_pct, 1)
+
+
+# ─────────────────────────────────────────────
+#  SPY REGIME CHECK
 # ─────────────────────────────────────────────
 def get_spy_regime(as_of_date: date) -> bool | None:
-    """
-    Returns True  if SPY MA10 > MA20 on as_of_date (regime bullish — longs allowed).
-    Returns False if SPY MA10 <= MA20 (regime bearish — longs suppressed).
-    Returns None  if SPY data is unavailable (filter disabled for this run).
-    Uses a direct yf.download call (not download_batch) to avoid the
-    ATR/minimum-bar filter that would discard SPY.
-    """
     try:
         end_date   = as_of_date
-        start_date = end_date - timedelta(days=90)   # 90 days — plenty for MA20
+        start_date = end_date - timedelta(days=90)
         end_fetch  = end_date + timedelta(days=1)
 
         raw = yf.download(
@@ -275,13 +264,11 @@ def get_spy_regime(as_of_date: date) -> bool | None:
         if raw is None or raw.empty:
             return None
 
-        # Flatten MultiIndex if present (newer yfinance versions)
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
 
         raw      = raw.dropna(subset=["Close"])
-        as_of_ts = pd.Timestamp(as_of_date)
-        raw      = raw[raw.index <= as_of_ts]
+        raw      = raw[raw.index <= pd.Timestamp(as_of_date)]
 
         if len(raw) < MA_SLOW + 2:
             return None
@@ -304,9 +291,9 @@ def get_spy_regime(as_of_date: date) -> bool | None:
 # ─────────────────────────────────────────────
 st.set_page_config(page_title="Russell 3000 Screener", layout="wide")
 st.title("📈 Russell 3000 Cloud Screener")
-st.subheader("Supertrend + MA Confluence (Daily)")
+st.subheader("Supertrend + MA Confluence — Long & Short (Daily)")
 
-# --- Google Sheets connection ---
+# ── Google Sheets connection ──────────────────────────────────────────────────
 try:
     conn       = st.connection("gsheets", type=GSheetsConnection)
     df_tickers = conn.read(ttl=600)
@@ -326,7 +313,7 @@ except Exception as e:
     )
     st.stop()
 
-# --- Sidebar controls ---
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Screener Controls")
 
 use_samples = st.sidebar.checkbox("Use sample tickers for testing")
@@ -343,12 +330,10 @@ if max_tickers > 0:
 
 cross_window = st.sidebar.number_input(
     "MA crossover window (days)", min_value=1, max_value=30, value=MA_CROSS_LOOKBACK,
-    help="Only flag signals where MA10/MA20 crossed within this many bars"
 )
 
 batch_size = st.sidebar.number_input(
     "Batch size", min_value=1, max_value=200, value=BATCH_SIZE,
-    help="Tickers downloaded per yfinance batch call (50 recommended)"
 )
 
 st.sidebar.markdown("---")
@@ -357,10 +342,8 @@ as_of_date = st.sidebar.date_input(
     "Run screener as of",
     value=date.today(),
     max_value=date.today(),
-    help="Evaluate signals as at close of this date. Cannot be a future date."
 )
 
-# Warn if a weekend or future date is selected
 if as_of_date > date.today():
     st.sidebar.warning("Date cannot be in the future — defaulting to today.")
     as_of_date = date.today()
@@ -372,35 +355,37 @@ if as_of_date.weekday() >= 5:
 
 st.sidebar.markdown("---")
 
-# --- SPY Regime Filter ---
 st.sidebar.subheader("📡 SPY Regime Filter")
 use_spy_regime = st.sidebar.checkbox(
     "SPY Regime Filter (MA10 > MA20)",
     value=True,
-    help="Only show LONG signals when SPY 10-day MA is above 20-day MA on the signal date."
+    help="Only show LONG signals when SPY MA10 > MA20. Short signals always shown."
 )
 
 st.sidebar.markdown("---")
 
-# --- Capital Allocation ---
+st.sidebar.subheader("🔻 Short Signal Filters")
+st.sidebar.caption(
+    f"Applied automatically:\n"
+    f"• >{SHORT_DIST_MIN:.0f}% below 52-week high\n"
+    f"• Down >{abs(SHORT_CHANGE_MAX):.0f}% on the year"
+)
+
+st.sidebar.markdown("---")
+
 st.sidebar.subheader("💰 Capital Allocation")
 capital = st.sidebar.number_input(
-    "Total capital ($)",
-    min_value=1_000,
-    max_value=100_000_000,
-    value=100_000,
-    step=1_000,
-    help="Total portfolio capital used to size positions."
+    "Total capital ($)", min_value=1_000, max_value=100_000_000,
+    value=100_000, step=1_000,
 )
 max_risk_pct = st.sidebar.number_input(
     "Max risk per trade (% of capital)",
     min_value=0.1, max_value=5.0, value=1.0, step=0.1,
-    help="Maximum $ loss if stop is hit, as a % of capital. Default 1%."
+    help="Applies to both long and short sizing."
 )
 max_position_pct = st.sidebar.number_input(
     "Max position size (% of capital)",
     min_value=1.0, max_value=100.0, value=20.0, step=1.0,
-    help="Maximum $ allocated to a single position, as a % of capital. Default 20%."
 )
 
 max_risk_dollars     = capital * (max_risk_pct     / 100)
@@ -408,21 +393,22 @@ max_position_dollars = capital * (max_position_pct / 100)
 
 run_button = st.sidebar.button("🚀 Run Screener")
 
-# --- Main scan loop ---
+# ── Main scan ─────────────────────────────────────────────────────────────────
 if run_button:
     long_hits, short_hits, errors = [], [], []
-    batches       = [tickers[i : i + int(batch_size)] for i in range(0, len(tickers), int(batch_size))]
+    batches       = [tickers[i : i + int(batch_size)]
+                     for i in range(0, len(tickers), int(batch_size))]
     total         = len(tickers)
     total_batches = len(batches)
     tickers_done  = 0
 
-    # ── SPY regime check ──────────────────────────────────────────────────────
+    # SPY regime check
     spy_regime_ok = None
     if use_spy_regime:
         with st.spinner("Checking SPY regime (MA10 vs MA20)…"):
             spy_regime_ok = get_spy_regime(as_of_date)
         if spy_regime_ok is None:
-            st.warning("⚠️ Could not fetch SPY data — regime filter disabled for this run.")
+            st.warning("⚠️ Could not fetch SPY data — regime filter disabled.")
         elif spy_regime_ok:
             st.success("✅ SPY regime: BULLISH (MA10 > MA20) — long signals enabled.")
         else:
@@ -449,71 +435,96 @@ if run_button:
             tickers_done += 1
             progress_bar.progress(tickers_done / total)
             status_text.text(
-                f"📊 Scanning {ticker} ({tickers_done}/{total}, batch {b_idx + 1}/{total_batches})"
+                f"📊 Scanning {ticker} ({tickers_done}/{total}, "
+                f"batch {b_idx + 1}/{total_batches})"
             )
 
             if ticker not in price_data:
                 continue
 
             try:
-                raw_df = price_data[ticker]
-                # Slice to as_of_date so signals are evaluated at that day's close
+                raw_df   = price_data[ticker]
                 as_of_ts = pd.Timestamp(as_of_date)
                 raw_df   = raw_df[raw_df.index <= as_of_ts]
                 if len(raw_df) < MA_SLOW + MA_CROSS_LOOKBACK + 2:
                     continue
-                df            = calc_indicators(raw_df)
-                sig, days_ago = check_signals(df, cross_lookback=int(cross_window))
+                df = calc_indicators(raw_df)
             except Exception as e:
                 errors.append(f"{ticker}: {str(e)[:120]}")
-                continue
-
-            if sig is None:
                 continue
 
             last  = df.iloc[-1]
             prev  = df.iloc[-2]
             chg   = (last["Close"] - prev["Close"]) / prev["Close"] * 100
             price = float(last["Close"])
-            sl    = float(last["Low"])    # stop loss = low of signal bar
 
-            # ── Position sizing ───────────────────────────────────────────────
-            risk_per_share = price - sl
-            if risk_per_share > 0:
-                shares_by_risk     = max_risk_dollars / risk_per_share
-                shares_by_position = max_position_dollars / price
-                shares             = int(min(shares_by_risk, shares_by_position))
-            else:
-                shares = 0
+            # ── Long ─────────────────────────────────────────────────────────
+            try:
+                long_sig, long_days = check_long_signal(df, int(cross_window))
+            except Exception:
+                long_sig = False
 
-            position_value = shares * price
-            dollar_risk    = shares * risk_per_share if shares > 0 else 0.0
-
-            row = {
-                "Ticker":           ticker,
-                "Signal":           sig,
-                "Date":             df.index[-1].strftime("%Y-%m-%d"),
-                "Price ($)":        round(price, 2),
-                "Stop Loss ($)":    round(sl, 2),
-                "Shares":           shares,
-                "Position ($)":     round(position_value, 2),
-                "Risk ($)":         round(dollar_risk, 2),
-                "MA10 ($)":         round(float(last["ma_fast"]), 2),
-                "MA20 ($)":         round(float(last["ma_slow"]), 2),
-                "Change %":         round(chg, 2),
-                "Cross (days ago)": days_ago,
-            }
-
-            if sig == "LONG":
-                # Gate on SPY regime — skip if filter is on and regime is bearish
-                if use_spy_regime and spy_regime_ok is False:
-                    pass   # regime bearish — suppress long signal
+            if long_sig and not (use_spy_regime and spy_regime_ok is False):
+                sl  = float(last["Low"])
+                rps = price - sl
+                if rps > 0:
+                    shares = int(min(max_risk_dollars / rps,
+                                     max_position_dollars / price))
                 else:
-                    long_hits.append(row)
-            else:
-                short_hits.append(row)
+                    shares = 0
+                long_hits.append({
+                    "Ticker"           : ticker,
+                    "Date"             : df.index[-1].strftime("%Y-%m-%d"),
+                    "Price ($)"        : round(price, 2),
+                    "Stop Loss ($)"    : round(sl, 2),
+                    "Risk/Share ($)"   : round(rps, 2),
+                    "Shares"           : shares,
+                    "Position ($)"     : round(shares * price, 2),
+                    "Risk ($)"         : round(shares * rps, 2),
+                    "MA10 ($)"         : round(float(last["ma_fast"]), 2),
+                    "MA20 ($)"         : round(float(last["ma_slow"]), 2),
+                    "Change %"         : round(chg, 2),
+                    "Cross (days ago)" : long_days,
+                })
 
-        results_text.text(f"✅ Found: {len(long_hits)} long  |  {len(short_hits)} short")
+            # ── Short ────────────────────────────────────────────────────────
+            try:
+                short_sig, short_days, dist_pct, change_pct = check_short_signal(
+                    df, int(cross_window)
+                )
+            except Exception:
+                short_sig = False
+
+            if short_sig:
+                sl  = float(last["High"])
+                rps = sl - price
+                if rps > 0:
+                    shares = int(min(max_risk_dollars / rps,
+                                     max_position_dollars / price))
+                else:
+                    shares = 0
+                tp = price - 2 * rps
+                short_hits.append({
+                    "Ticker"            : ticker,
+                    "Date"              : df.index[-1].strftime("%Y-%m-%d"),
+                    "Price ($)"         : round(price, 2),
+                    "Stop Loss ($)"     : round(sl, 2),
+                    "TP 2R ($)"         : round(tp, 2),
+                    "Risk/Share ($)"    : round(rps, 2),
+                    "Shares"            : shares,
+                    "Position ($)"      : round(shares * price, 2),
+                    "Risk ($)"          : round(shares * rps, 2),
+                    "MA10 ($)"          : round(float(last["ma_fast"]), 2),
+                    "MA20 ($)"          : round(float(last["ma_slow"]), 2),
+                    "Change %"          : round(chg, 2),
+                    "Dist 52W High (%)" : dist_pct,
+                    "1Y Change (%)"     : change_pct,
+                    "Cross (days ago)"  : short_days,
+                })
+
+        results_text.text(
+            f"✅ Found: {len(long_hits)} long  |  {len(short_hits)} short"
+        )
 
     status_text.text("✅ Scan complete!")
 
@@ -523,78 +534,110 @@ if run_button:
 
     st.header(f"📊 Results — as of {as_of_date.strftime('%d %b %Y')}")
 
-    # ── SPY regime status banner ──────────────────────────────────────────────
+    # SPY banner
     if use_spy_regime:
         if spy_regime_ok is True:
             st.info("📡 SPY Regime: **BULLISH** (MA10 > MA20) — long signals shown.")
         elif spy_regime_ok is False:
             st.warning("📡 SPY Regime: **BEARISH** (MA10 ≤ MA20) — long signals suppressed.")
         else:
-            st.warning("📡 SPY Regime: **UNAVAILABLE** — regime filter was bypassed.")
+            st.warning("📡 SPY Regime: **UNAVAILABLE** — regime filter bypassed.")
     else:
-        st.info("📡 SPY Regime Filter: **OFF** — all long signals shown regardless of market.")
+        st.info("📡 SPY Regime Filter: **OFF** — all long signals shown.")
 
-    # ── Summary metrics ───────────────────────────────────────────────────────
+    # Summary
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tickers Scanned", total)
-    c2.metric("Long Signals",    len(long_hits))
-    c3.metric("Short Signals",   len(short_hits))
-    success_rate = (total - len(errors)) / total * 100 if total else 0
-    c4.metric("Success Rate",    f"{success_rate:.1f}%")
+    c1.metric("Tickers Scanned",  total)
+    c2.metric("🟢 Long Signals",  len(long_hits))
+    c3.metric("🔴 Short Signals", len(short_hits))
+    c4.metric("Success Rate",     f"{(total - len(errors)) / total * 100:.1f}%" if total else "—")
 
     st.markdown("---")
-
-    # ── Capital allocation summary ────────────────────────────────────────────
     st.caption(
         f"Capital: **${capital:,.0f}**  |  "
         f"Max risk/trade: **${max_risk_dollars:,.0f}** ({max_risk_pct}%)  |  "
         f"Max position: **${max_position_dollars:,.0f}** ({max_position_pct}%)"
     )
 
-    # ── Long signals table ────────────────────────────────────────────────────
+    # ── Long table ────────────────────────────────────────────────────────────
     st.subheader("🟢 Long Signals")
+    st.caption("SPY regime filter ON · MA200 filter OFF · Stop = signal day Low")
+
     if long_hits:
-        df_long = pd.DataFrame(long_hits)
-        display_cols = [
-            "Ticker", "Date", "Price ($)", "Stop Loss ($)",
-            "Shares", "Position ($)", "Risk ($)",
-            "MA10 ($)", "MA20 ($)", "Change %", "Cross (days ago)",
-        ]
-        df_display = df_long[display_cols].copy()
-        fmt_dollar = ["Price ($)", "Stop Loss ($)", "MA10 ($)", "MA20 ($)"]
-        fmt_money  = ["Position ($)", "Risk ($)"]
+        df_long     = pd.DataFrame(long_hits)
+        long_cols   = ["Ticker", "Date", "Price ($)", "Stop Loss ($)",
+                        "Shares", "Position ($)", "Risk ($)",
+                        "MA10 ($)", "MA20 ($)", "Change %", "Cross (days ago)"]
+        fmt_dollar  = ["Price ($)", "Stop Loss ($)", "MA10 ($)", "MA20 ($)"]
+        fmt_money   = ["Position ($)", "Risk ($)"]
         st.dataframe(
-            df_display.style
+            df_long[long_cols].style
                 .format({c: "${:,.2f}" for c in fmt_dollar})
                 .format({c: "${:,.0f}" for c in fmt_money})
                 .format({"Change %": "{:+.2f}%", "Shares": "{:,}"}),
-            use_container_width=True,
-            hide_index=True,
+            use_container_width=True, hide_index=True,
         )
-
-        # Aggregate risk exposure
-        total_position = df_long["Position ($)"].sum()
-        total_risk     = df_long["Risk ($)"].sum()
-        pct_deployed   = total_position / capital * 100 if capital else 0
-        pct_at_risk    = total_risk     / capital * 100 if capital else 0
-
+        tp  = df_long["Position ($)"].sum()
+        tr  = df_long["Risk ($)"].sum()
         ec1, ec2, ec3, ec4 = st.columns(4)
-        ec1.metric("Signals found",    len(long_hits))
-        ec2.metric("Total deployed",   f"${total_position:,.0f}  ({pct_deployed:.1f}%)")
-        ec3.metric("Total $ at risk",  f"${total_risk:,.0f}  ({pct_at_risk:.1f}%)")
-        ec4.metric("Avg risk/trade",   f"${total_risk / len(long_hits):,.0f}" if long_hits else "—")
-
+        ec1.metric("Signals found",   len(long_hits))
+        ec2.metric("Total deployed",  f"${tp:,.0f}  ({tp/capital*100:.1f}%)")
+        ec3.metric("Total $ at risk", f"${tr:,.0f}  ({tr/capital*100:.1f}%)")
+        ec4.metric("Avg risk/trade",  f"${tr/len(long_hits):,.0f}")
         st.download_button(
             "📥 Download Long Signals CSV",
             df_long.to_csv(index=False),
-            f"long_{datetime.now():%Y%m%d_%H%M%S}.csv",
-            "text/csv",
+            f"long_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv",
         )
     else:
         if use_spy_regime and spy_regime_ok is False:
             st.info("No long signals shown — SPY regime is bearish.")
         else:
             st.info("No long signals found.")
+
+    st.markdown("---")
+
+    # ── Short table ───────────────────────────────────────────────────────────
+    st.subheader("🔴 Short Signals")
+    st.caption(
+        f"No regime filter · Stop = signal day High · TP = 2R  · "
+        f"Filters: 52W dist >{SHORT_DIST_MIN:.0f}% | 1Y change <{SHORT_CHANGE_MAX:.0f}%"
+    )
+
+    if short_hits:
+        df_short    = pd.DataFrame(short_hits)
+        short_cols  = ["Ticker", "Date", "Price ($)", "Stop Loss ($)", "TP 2R ($)",
+                        "Shares", "Position ($)", "Risk ($)",
+                        "MA10 ($)", "MA20 ($)", "Change %",
+                        "Dist 52W High (%)", "1Y Change (%)", "Cross (days ago)"]
+        fmt_dollar_s = ["Price ($)", "Stop Loss ($)", "TP 2R ($)", "MA10 ($)", "MA20 ($)"]
+        fmt_money_s  = ["Position ($)", "Risk ($)"]
+        st.dataframe(
+            df_short[short_cols].style
+                .format({c: "${:,.2f}" for c in fmt_dollar_s})
+                .format({c: "${:,.0f}" for c in fmt_money_s})
+                .format({
+                    "Change %"          : "{:+.2f}%",
+                    "Dist 52W High (%)" : "{:.1f}%",
+                    "1Y Change (%)"     : "{:.1f}%",
+                    "Shares"            : "{:,}",
+                }),
+            use_container_width=True, hide_index=True,
+        )
+        tp_s  = df_short["Position ($)"].sum()
+        tr_s  = df_short["Risk ($)"].sum()
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Signals found",   len(short_hits))
+        sc2.metric("Total exposure",  f"${tp_s:,.0f}  ({tp_s/capital*100:.1f}%)")
+        sc3.metric("Total $ at risk", f"${tr_s:,.0f}  ({tr_s/capital*100:.1f}%)")
+        sc4.metric("Avg risk/trade",  f"${tr_s/len(short_hits):,.0f}")
+        st.download_button(
+            "📥 Download Short Signals CSV",
+            df_short.to_csv(index=False),
+            f"short_{datetime.now():%Y%m%d_%H%M%S}.csv", "text/csv",
+        )
+    else:
+        st.info("No short signals found.")
 
 else:
     st.info("👈 Click 'Run Screener' in the sidebar to start.")
