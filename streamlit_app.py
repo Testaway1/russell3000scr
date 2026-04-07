@@ -273,13 +273,12 @@ def get_spy_regime(as_of_date: date) -> bool | None:
         if len(raw) < MA_SLOW + 2:
             return None
 
-        ma_fast = raw["Close"].rolling(MA_FAST).mean().iloc[-1]
         ma_slow = raw["Close"].rolling(MA_SLOW).mean().iloc[-1]
 
-        if pd.isna(ma_fast) or pd.isna(ma_slow):
+        if pd.isna(ma_slow):
             return None
 
-        return bool(ma_fast > ma_slow)
+        return bool(raw["Close"].iloc[-1] > ma_slow)
 
     except Exception as e:
         st.warning(f"SPY regime fetch error: {e}")
@@ -357,9 +356,9 @@ st.sidebar.markdown("---")
 
 st.sidebar.subheader("📡 SPY Regime Filter")
 use_spy_regime = st.sidebar.checkbox(
-    "SPY Regime Filter (MA10 > MA20)",
+    "SPY Regime Filter (Close > MA20)",
     value=True,
-    help="Only show LONG signals when SPY MA10 > MA20. Short signals always shown."
+    help="Only show LONG signals when SPY Close > MA20. Short signals always shown."
 )
 
 st.sidebar.markdown("---")
@@ -405,14 +404,14 @@ if run_button:
     # SPY regime check
     spy_regime_ok = None
     if use_spy_regime:
-        with st.spinner("Checking SPY regime (MA10 vs MA20)…"):
+        with st.spinner("Checking SPY regime (Close vs MA20)…"):
             spy_regime_ok = get_spy_regime(as_of_date)
         if spy_regime_ok is None:
             st.warning("⚠️ Could not fetch SPY data — regime filter disabled.")
         elif spy_regime_ok:
-            st.success("✅ SPY regime: BULLISH (MA10 > MA20) — long signals enabled.")
+            st.success("✅ SPY regime: BULLISH (Close > MA20) — long signals enabled.")
         else:
-            st.warning("🚫 SPY regime: BEARISH (MA10 ≤ MA20) — long signals suppressed.")
+            st.warning("🚫 SPY regime: BEARISH (Close ≤ MA20) — long signals suppressed.")
 
     progress_bar = st.progress(0)
     status_text  = st.empty()
@@ -537,9 +536,9 @@ if run_button:
     # SPY banner
     if use_spy_regime:
         if spy_regime_ok is True:
-            st.info("📡 SPY Regime: **BULLISH** (MA10 > MA20) — long signals shown.")
+            st.info("📡 SPY Regime: **BULLISH** (Close > MA20) — long signals shown.")
         elif spy_regime_ok is False:
-            st.warning("📡 SPY Regime: **BEARISH** (MA10 ≤ MA20) — long signals suppressed.")
+            st.warning("📡 SPY Regime: **BEARISH** (Close ≤ MA20) — long signals suppressed.")
         else:
             st.warning("📡 SPY Regime: **UNAVAILABLE** — regime filter bypassed.")
     else:
